@@ -1,0 +1,25 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Claude Agent Runner</title>
+  <link rel="icon" href="/icon.ico" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <a href="#/" class="brand"><img src="/icon.png" alt="" width="22" height="22" />Claude Agent Runner</a>
+    <nav>
+      <a href="#/" data-nav="dashboard">Projects</a>
+      <a href="#/settings" data-nav="settings">Settings</a>
+    </nav>
+  </header>
+  <div id="banner"></div>
+  <main id="view"><p class="muted">Loading…</p></main>
+  <div id="modal-root"></div>
+  <div id="toast-root"></div>
+  <script src="/vendor/marked.js"></script>
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,600 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
+import http from 'node:http';
+import express from 'express';
+import { APP_ROOT, DATA_DIR, LOG_DIR, RUNTIME_INFO, appVersion } from './paths.js';
+import { db, backupDatabaseIfDue } from './db.js';
+import { bus, emit } from './events.js';
+import { getSetting, setSetting, publicSettings, DEFAULTS } from './settings.js';
+import { importKeyFile } from './keyfile.js';
+import { listProjects, getProject, createProject, updateProject, deleteProject, setProjectFields, monthCost, budgetPaused, effectiveLimits } from './projects.js';
+import {
+  listEntries, getEntry, memoryStore, searchMemory, entryHistory, historyVersion, ensureStandardEntries,
+  exportMemory, importMemory, normalizePath, MemoryError,
+} from './memory.js';
+import { startRun, stopRun, stopAllRuns, activeRunId, recoverInterruptedRuns } from './runner.js';
+import { startScheduler, refreshSchedule, removeSchedule, previewSchedule, nextRunFor, describeSchedule, scheduleToCron } from './scheduler.js';
+import { isGitRepo, restoreFolder, restorePointAvailable } from './restorePoints.js';
+import { testKey, listModels, pickDefaultModel } from './anthropicApi.js';
+import { setStartWithWindows } from './autostart.js';
+import { BRIEF_TEMPLATE, DEFAULT_TASK_PROMPT, buildBrief } from './templates.js';
+import { pickFolder, suggestProjectFolder, openPath, diagnostics, documentsDir } from './system.js';
+
+const EXIT_ALREADY_RUNNING = 3;
+const EXIT_RESTART = 75;
+const args = process.argv.slice(2);
+
+process.on('uncaughtException', (err) => console.error('Unexpected error (the app keeps running):', err));
+process.on('unhandledRejection', (err) => console.error('Unexpected error (the app keeps running):', err));
+
+const app = express();
+app.disable('x-powered-by');
+app.use(express.json({ limit: '5mb' }));
+
+// Only this computer's browser, on pages served by this app, may use it (protects against other websites poking at localhost).
+app.use((req, res, next) => {
+  if (!['127.0.0.1', 'localhost'].includes(req.hostname)) return res.status(403).send('Forbidden');
+  next();
+});
+app.use('/api', (req, res, next) => {
+  const origin = req.get('origin');
+  if (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) return res.status(403).json({ error: 'Forbidden' });
+  next();
+});
+
+const wrap = (fn) => async (req, res) => {
+  try {
+    const result = await fn(req, res);
+    if (!res.headersSent) res.json(result ?? { ok: true });
+  } catch (err) {
+    const status = err.status ?? (err instanceof MemoryError ? 400 : 500);
+    if (status === 500) console.error(err);
+    if (!res.headersSent) res.status(status).json({ error: err.message });
+  }
+};
+
+const httpError = (status, message) => Object.assign(new Error(message), { status });
+
+function requireProject(id) {
+  const project = getProject(id);
+  if (!project) throw httpError(404, 'Project not found');
+  return project;
+}
+
+function parseJson(text, fallback) {
+  try {
+    return text ? JSON.parse(text) : fallback;
+  } catch {
+    return fallback;
+  }
+}
+
+function runRow(r) {
+  if (!r) return null;
+  const changed = parseJson(r.changed_files, null);
+  const restoreRef = parseJson(r.restore_ref, null);
+  return {
+    ...r,
+    changed_files: changed,
+    changed_count: changed ? changed.added.length + changed.changed.length + changed.removed.length : null,
+    memory_written: parseJson(r.memory_written, []),
+    restore_ref: restoreRef ? { type: restoreRef.type, commit: restoreRef.commit, warning: restoreRef.warning, files: restoreRef.files } : null,
+    restore_available: restorePointAvailable(restoreRef),
+  };
+}
+
+function projectSummary(p) {
+  const last = db.prepare("SELECT * FROM runs WHERE project_id = ? AND status != 'skipped' ORDER BY id DESC LIMIT 1").get(p.id);
+  let folderExists = false;
+  let hasIndex = false;
+  try {
+    folderExists = fs.statSync(p.folder).isDirectory();
+    hasIndex = folderExists && fs.existsSync(path.join(p.folder, 'index.html'));
+  } catch {
+    /* missing */
+  }
+  return {
+    ...p,
+    schedule_text: describeSchedule(p.schedule),
+    next_run: nextRunFor(p),
+    last_run: last ? { id: last.id, status: last.status, started_at: last.started_at, cost_usd: last.cost_usd } : null,
+    month_cost: monthCost(p.id),
+    active_run_id: activeRunId(p.id),
+    limits: effectiveLimits(p),
+    folder_exists: folderExists,
+    has_index_html: hasIndex,
+  };
+}
+
+/** Rejects folders where an unattended agent should never work: drive roots, system folders, whole user folders. */
+async function checkFolderSafety(folder) {
+  const resolved = path.resolve(folder);
+  const lower = resolved.toLowerCase().replace(/[\\/]+$/, '');
+  if (lower.startsWith(APP_ROOT.toLowerCase())) return 'The project folder cannot be inside the app folder.';
+  if (path.parse(resolved).root.toLowerCase().replace(/[\\/]+$/, '') === lower) return 'Please do not use a whole drive. Choose or create a separate folder for this project.';
+  const home = os.homedir();
+  const forbidden = [
+    home,
+    path.join(home, 'Desktop'),
+    path.join(home, 'Documents'),
+    path.join(home, 'Downloads'),
+    path.join(home, 'OneDrive'),
+    await documentsDir(),
+    process.env.OneDrive,
+    process.env.SystemRoot,
+    process.env.ProgramFiles,
+    process.env['ProgramFiles(x86)'],
+    process.env.ProgramData,
+  ].filter(Boolean).map((f) => path.resolve(f).toLowerCase());
+  if (forbidden.includes(lower)) return 'Please choose or create a separate folder just for this project (not your whole Desktop, Documents or user folder).';
+  for (const sys of [process.env.SystemRoot, process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter(Boolean)) {
+    if (lower.startsWith(path.resolve(sys).toLowerCase() + path.sep)) return 'Please do not use a Windows system folder. Choose a folder in your Documents instead.';
+  }
+  return null;
+}
+
+async function validateFolder(folder, { create = false } = {}) {
+  folder = String(folder ?? '').trim().replace(/^"(.*)"$/, '$1');
+  if (!folder) return { ok: false, message: 'Choose a folder.' };
+  if (!path.isAbsolute(folder)) return { ok: false, message: 'Use a full path, for example C:\\Users\\you\\Documents\\Claude Projects\\My app — or press "Browse…".' };
+  const resolved = path.resolve(folder);
+  const unsafe = await checkFolderSafety(resolved);
+  if (unsafe) return { ok: false, message: unsafe };
+  if (!fs.existsSync(resolved)) {
+    if (!create) return { ok: true, folder: resolved, missing: true, empty: true, is_git: false, message: 'This folder does not exist yet. It will be created for you.' };
+    try {
+      fs.mkdirSync(resolved, { recursive: true });
+    } catch (err) {
+      return { ok: false, message: `The folder could not be created: ${err.message}` };
+    }
+  }
+  if (!fs.statSync(resolved).isDirectory()) return { ok: false, message: 'This path is a file, not a folder.' };
+  const items = fs.readdirSync(resolved);
+  return {
+    ok: true,
+    folder: resolved,
+    empty: items.length === 0,
+    is_git: await isGitRepo(resolved),
+    message: items.length ? `Folder found (${items.length} items inside). Claude will work with what is already there.` : 'Empty folder found.',
+  };
+}
+
+// ---------- App state & settings ----------
+
+app.get('/api/ping', (req, res) => res.json({ app: 'claude-agent-runner', version: appVersion(), pid: process.pid, root: APP_ROOT }));
+
+app.get('/api/state', wrap(() => ({
+  settings: publicSettings(),
+  budget_paused: budgetPaused(),
+  month_cost: monthCost(),
+  version: appVersion(),
+  can_restart: process.env.RUNNER_LAUNCHER === '1',
+})));
+
+app.get('/api/settings', wrap(() => publicSettings()));
+
+app.put('/api/settings', wrap(async (req) => {
+  const body = req.body ?? {};
+  for (const [key, value] of Object.entries(body)) {
+    if (key === 'api_key') {
+      const v = String(value ?? '').trim();
+      if (v) {
+        setSetting('api_key', v);
+        setSetting('api_key_source', 'settings');
+      }
+      continue;
+    }
+    if (key === 'start_with_windows') {
+      const r = setStartWithWindows(Boolean(value));
+      if (!r.ok) throw httpError(400, r.message);
+      setSetting(key, Boolean(value));
+      continue;
+    }
+    if (key in DEFAULTS && !['heartbeat', 'budget_paused_month', 'key_file_hash', 'api_key_source'].includes(key)) setSetting(key, value);
+  }
+  if (budgetPaused() && monthCost() < getSetting('monthly_cap_usd')) setSetting('budget_paused_month', '');
+  emit('projects-changed', {});
+  return publicSettings();
+}));
+
+app.post('/api/settings/test-key', wrap(async (req) => testKey(String(req.body?.api_key || '').trim() || getSetting('api_key'))));
+
+app.post('/api/budget/resume', wrap(() => {
+  if (monthCost() >= getSetting('monthly_cap_usd')) throw httpError(400, "This month's spending is still above the monthly cap. Raise the cap in Settings first.");
+  setSetting('budget_paused_month', '');
+  emit('projects-changed', {});
+}));
+
+app.get('/api/models', wrap(() => listModels()));
+
+app.get('/api/templates', wrap(() => ({ brief: BRIEF_TEMPLATE, task_prompt: DEFAULT_TASK_PROMPT })));
+
+app.get('/api/diagnostics', wrap(() => diagnostics()));
+
+app.post('/api/open', wrap((req) => {
+  const what = req.body?.what;
+  const target = what === 'logs' ? LOG_DIR : what === 'data' ? DATA_DIR : what === 'app' ? APP_ROOT : null;
+  if (!target) throw httpError(400, 'Unknown folder');
+  openPath(target);
+}));
+
+app.post('/api/shutdown', wrap((req, res) => {
+  res.json({ ok: true });
+  setTimeout(() => shutdown(0), 200);
+}));
+
+app.post('/api/restart', wrap((req, res) => {
+  if (process.env.RUNNER_LAUNCHER !== '1') throw httpError(400, 'Restart only works when the app was started with start.bat.');
+  res.json({ ok: true });
+  setTimeout(() => shutdown(EXIT_RESTART), 200);
+}));
+
+// ---------- Helpers for forms ----------
+
+app.post('/api/validate-folder', wrap((req) => validateFolder(req.body?.folder, { create: Boolean(req.body?.create) })));
+
+app.get('/api/suggest-folder', wrap(async (req) => ({ folder: await suggestProjectFolder(String(req.query.name ?? '')) })));
+
+app.post('/api/pick-folder', wrap(async (req) => {
+  try {
+    return { folder: await pickFolder(String(req.body?.initial ?? '')) };
+  } catch (err) {
+    throw httpError(400, err.killed ? 'The folder window was open too long and was closed.' : err.message);
+  }
+}));
+
+app.post('/api/schedule/preview', wrap((req) => {
+  try {
+    const { schedule, timezone } = req.body ?? {};
+    return { ok: true, cron: scheduleToCron(schedule), text: describeSchedule(schedule), next: previewSchedule(schedule, timezone || 'Europe/Istanbul', 3) };
+  } catch (err) {
+    return { ok: false, message: err.message };
+  }
+}));
+
+// ---------- Projects ----------
+
+app.get('/api/projects', wrap(() => listProjects().map(projectSummary)));
+
+function checkSchedule(body) {
+  if (!body.schedule) return;
+  try {
+    scheduleToCron(body.schedule);
+    previewSchedule(body.schedule, body.timezone || 'Europe/Istanbul', 1);
+  } catch (err) {
+    throw httpError(400, `Schedule: ${err.message}`);
+  }
+}
+
+app.post('/api/projects', wrap(async (req) => {
+  const body = req.body ?? {};
+  if (!String(body.name ?? '').trim()) throw httpError(400, 'Give the project a name.');
+  const folder = await validateFolder(body.folder, { create: true });
+  if (!folder.ok) throw httpError(400, folder.message);
+  checkSchedule(body);
+  const project = createProject({
+    ...body,
+    name: String(body.name).trim(),
+    folder: folder.folder,
+    task_prompt: String(body.task_prompt ?? '').trim() || DEFAULT_TASK_PROMPT,
+  });
+  ensureStandardEntries(project.id);
+  if (String(body.brief ?? '').trim()) memoryStore(project.id, { changedBy: 'owner' }).save('/memories/brief.md', buildBrief(body.brief));
+  refreshSchedule(project.id);
+  emit('projects-changed', {});
+  return projectSummary(project);
+}));
+
+app.get('/api/projects/:id', wrap(async (req) => {
+  const p = requireProject(req.params.id);
+  return { ...projectSummary(p), is_git: await isGitRepo(p.folder) };
+}));
+
+app.put('/api/projects/:id', wrap(async (req) => {
+  const current = requireProject(req.params.id);
+  const body = { ...req.body };
+  checkSchedule({ timezone: current.timezone, ...body });
+  if (body.folder && path.resolve(String(body.folder)) !== current.folder) {
+    if (activeRunId(current.id)) throw httpError(409, 'Stop the active run before changing the folder.');
+    const folder = await validateFolder(body.folder, { create: true });
+    if (!folder.ok) throw httpError(400, folder.message);
+    body.folder = folder.folder;
+  } else {
+    delete body.folder;
+  }
+  if ('name' in body && !String(body.name).trim()) throw httpError(400, 'The project needs a name.');
+  const p = updateProject(current.id, body);
+  refreshSchedule(p.id);
+  emit('projects-changed', {});
+  return projectSummary(p);
+}));
+
+app.delete('/api/projects/:id', wrap((req) => {
+  const p = requireProject(req.params.id);
+  if (activeRunId(p.id)) throw httpError(409, 'Stop the active run first.');
+  removeSchedule(p.id);
+  deleteProject(p.id);
+  emit('projects-changed', {});
+}));
+
+app.post('/api/projects/:id/run', wrap((req) => {
+  const p = requireProject(req.params.id);
+  if (!getSetting('api_key')) throw httpError(400, 'No Claude API key is set yet. Open Settings and enter your API key first.');
+  return startRun(p.id, 'manual');
+}));
+
+app.post('/api/projects/:id/stop', wrap((req) => {
+  const p = requireProject(req.params.id);
+  return { stopped: stopRun(p.id) };
+}));
+
+app.post('/api/projects/:id/enabled', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const updated = updateProject(p.id, { enabled: Boolean(req.body?.enabled) });
+  refreshSchedule(p.id);
+  emit('projects-changed', {});
+  return projectSummary(updated);
+}));
+
+app.post('/api/projects/:id/fresh-session', wrap((req) => {
+  const p = requireProject(req.params.id);
+  setProjectFields(p.id, { fresh_pending: 1 });
+  emit('projects-changed', {});
+  return projectSummary(getProject(p.id));
+}));
+
+app.post('/api/projects/:id/open', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const target = req.body?.target === 'index' ? path.join(p.folder, 'index.html') : p.folder;
+  openPath(target);
+}));
+
+// ---------- Memory ----------
+
+app.get('/api/projects/:id/memory', wrap((req) => {
+  const p = requireProject(req.params.id);
+  ensureStandardEntries(p.id);
+  return listEntries(p.id).map((e) => ({ path: e.path, content: e.content, created_at: e.created_at, updated_at: e.updated_at }));
+}));
+
+app.put('/api/projects/:id/memory', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const { path: entryPath, content } = req.body ?? {};
+  memoryStore(p.id, { changedBy: 'owner' }).save(entryPath, String(content ?? ''));
+  emit('memory-changed', { projectId: p.id });
+  return getEntry(p.id, normalizePath(entryPath));
+}));
+
+app.post('/api/projects/:id/memory/delete', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const target = normalizePath(req.body?.path);
+  if (['/memories/brief.md', '/memories/plan.md', '/memories/progress.md', '/memories/decisions.md'].includes(target)) {
+    throw httpError(400, 'Standard entries cannot be deleted. Edit them instead.');
+  }
+  memoryStore(p.id, { changedBy: 'owner' }).remove(target);
+  emit('memory-changed', { projectId: p.id });
+}));
+
+app.get('/api/projects/:id/memory/search', wrap((req) => {
+  const p = requireProject(req.params.id);
+  return searchMemory(p.id, String(req.query.q ?? ''), 50);
+}));
+
+app.get('/api/projects/:id/memory/history', wrap((req) => {
+  const p = requireProject(req.params.id);
+  return entryHistory(p.id, String(req.query.path ?? ''));
+}));
+
+app.get('/api/projects/:id/memory/version/:hid', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const v = historyVersion(p.id, req.params.hid);
+  if (!v) throw httpError(404, 'Version not found');
+  return v;
+}));
+
+app.post('/api/projects/:id/memory/restore', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const restoredPath = memoryStore(p.id, { changedBy: 'owner (restore)' }).restoreVersion(Number(req.body?.history_id));
+  emit('memory-changed', { projectId: p.id });
+  return { path: restoredPath };
+}));
+
+app.post('/api/projects/:id/memory/export', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const folder = String(req.body?.folder ?? '').trim().replace(/^"(.*)"$/, '$1');
+  if (!folder || !path.isAbsolute(folder)) throw httpError(400, 'Choose a folder to export to.');
+  if ((path.resolve(folder) + path.sep).toLowerCase().startsWith((path.resolve(p.folder) + path.sep).toLowerCase())) {
+    throw httpError(400, 'Export memory to a folder outside the project folder, so memory files do not end up in the project.');
+  }
+  return { count: exportMemory(p.id, path.resolve(folder)), folder: path.resolve(folder) };
+}));
+
+app.post('/api/projects/:id/memory/import', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const folder = String(req.body?.folder ?? '').trim().replace(/^"(.*)"$/, '$1');
+  if (!folder || !fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) throw httpError(400, 'That folder does not exist.');
+  const count = importMemory(p.id, path.resolve(folder));
+  emit('memory-changed', { projectId: p.id });
+  return { count };
+}));
+
+// ---------- Runs ----------
+
+app.get('/api/projects/:id/runs', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const limit = Math.min(500, Number(req.query.limit) || 100);
+  return db.prepare('SELECT * FROM runs WHERE project_id = ? ORDER BY id DESC LIMIT ?').all(p.id, limit).map(runRow);
+}));
+
+app.get('/api/runs/:id', wrap((req) => {
+  const run = db.prepare('SELECT * FROM runs WHERE id = ?').get(Number(req.params.id));
+  if (!run) throw httpError(404, 'Run not found');
+  const logs = db.prepare('SELECT seq, ts, type, content FROM run_logs WHERE run_id = ? ORDER BY seq').all(run.id);
+  return { ...runRow(run), logs };
+}));
+
+app.post('/api/runs/:id/restore', wrap(async (req) => {
+  const run = db.prepare('SELECT * FROM runs WHERE id = ?').get(Number(req.params.id));
+  if (!run) throw httpError(404, 'Run not found');
+  const project = requireProject(run.project_id);
+  if (activeRunId(project.id)) throw httpError(409, 'A run is active on this project. Stop it before restoring.');
+  const ref = parseJson(run.restore_ref, null);
+  if (!restorePointAvailable(ref)) throw httpError(400, 'No restore point is available for this run.');
+  const { problems } = await restoreFolder(project.folder, ref);
+  console.log(`Project "${project.name}" folder restored to before run #${run.id}.`);
+  return { ok: true, problems };
+}));
+
+// ---------- Live updates (Server-Sent Events) ----------
+
+app.get('/api/events', (req, res) => {
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  res.flushHeaders();
+  res.write('retry: 3000\n\n');
+  const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+  bus.on('event', send);
+  const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
+  req.on('close', () => {
+    clearInterval(ping);
+    bus.off('event', send);
+  });
+});
+
+// ---------- Static UI ----------
+
+app.get('/vendor/marked.js', (req, res) => res.sendFile(path.join(APP_ROOT, 'node_modules', 'marked', 'lib', 'marked.umd.js')));
+app.use(express.static(path.join(APP_ROOT, 'public'), { setHeaders: (res) => res.set('Cache-Control', 'no-cache') }));
+app.use('/api', (req, res) => res.status(404).json({ error: 'Not found' }));
+
+// ---------- Startup & shutdown ----------
+
+function pingPort(port) {
+  return new Promise((resolve) => {
+    const req = http.get({ host: '127.0.0.1', port, path: '/api/ping', timeout: 2000 }, (res) => {
+      let body = '';
+      res.on('data', (c) => (body += c));
+      res.on('end', () => {
+        try {
+          resolve(JSON.parse(body));
+        } catch {
+          resolve(null);
+        }
+      });
+    });
+    req.on('timeout', () => req.destroy());
+    req.on('error', () => resolve(null));
+  });
+}
+
+/**
+ * True when this same installation already answers on the port. Each installation keeps its own
+ * data/runtime.json, so the process listed there is "us"; other copies of the app are not.
+ */
+async function pingOurs(port) {
+  const info = await pingPort(port);
+  if (info?.app !== 'claude-agent-runner') return false;
+  try {
+    const recorded = JSON.parse(fs.readFileSync(RUNTIME_INFO, 'utf8'));
+    if (recorded.pid === info.pid) return true;
+  } catch {
+    /* no record */
+  }
+  return String(info.root).toLowerCase() === APP_ROOT.toLowerCase();
+}
+
+/** Another server of this installation that is still running (found through data/runtime.json). */
+async function existingInstance() {
+  try {
+    const recorded = JSON.parse(fs.readFileSync(RUNTIME_INFO, 'utf8'));
+    const info = await pingPort(recorded.port);
+    return info?.app === 'claude-agent-runner' && info.pid === recorded.pid ? recorded : null;
+  } catch {
+    return null;
+  }
+}
+
+async function listen(firstPort) {
+  for (let port = firstPort; port < firstPort + 20; port++) {
+    const server = http.createServer(app);
+    try {
+      await new Promise((resolve, reject) => {
+        server.once('error', reject);
+        server.listen(port, '127.0.0.1', resolve);
+      });
+      return { server, port };
+    } catch (err) {
+      server.close();
+      if (err.code !== 'EADDRINUSE' && err.code !== 'EACCES') throw err;
+      if (await pingOurs(port)) return { alreadyRunning: true, port };
+      console.log(`Port ${port} is used by another program (or another copy of this app), trying ${port + 1}…`);
+    }
+  }
+  throw new Error(`No free port found between ${firstPort} and ${firstPort + 19}.`);
+}
+
+let shuttingDown = false;
+async function shutdown(code = 0) {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  console.log('Shutting down: stopping active runs…');
+  await stopAllRuns(25_000);
+  try {
+    const info = JSON.parse(fs.readFileSync(RUNTIME_INFO, 'utf8'));
+    if (info.pid === process.pid) fs.rmSync(RUNTIME_INFO, { force: true });
+  } catch {
+    /* ignore */
+  }
+  process.exit(code);
+}
+for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) process.on(sig, () => shutdown(0));
+
+async function checkDefaultModel() {
+  const { models, source } = await listModels();
+  if (source !== 'api' || !models.length) return;
+  const current = getSetting('default_model');
+  if (models.some((m) => m.id === current)) return;
+  const pick = pickDefaultModel(models);
+  if (pick) {
+    setSetting('default_model', pick);
+    console.log(`The default model "${current}" is not available for this API key; using "${pick}" instead.`);
+  }
+}
+
+const portArg = args.find((a) => a.startsWith('--port='));
+const firstPort = Number(portArg?.split('=')[1]) || Number(process.env.PORT) || getSetting('port') || 4280;
+const running = await existingInstance();
+if (running) {
+  console.log(`The app is already running at ${running.url}`);
+  process.exit(EXIT_ALREADY_RUNNING);
+}
+const result = await listen(firstPort);
+if (result.alreadyRunning) {
+  console.log(`The app is already running at http://127.0.0.1:${result.port}`);
+  process.exit(EXIT_ALREADY_RUNNING);
+}
+
+const url = `http://127.0.0.1:${result.port}`;
+fs.writeFileSync(RUNTIME_INFO, JSON.stringify({ port: result.port, url, pid: process.pid, startedAt: new Date().toISOString(), version: appVersion() }, null, 2));
+console.log(`Claude Agent Runner ${appVersion()} is running at ${url}`);
+
+try {
+  const keyResult = importKeyFile();
+  if (keyResult?.imported) console.log(`Loaded the API key from ${keyResult.file}.`);
+  else if (keyResult && keyResult.reason !== 'unchanged') console.log(`${keyResult.file}: ${keyResult.reason}.`);
+} catch (err) {
+  console.error('Could not read the API key file:', err.message);
+}
+
+recoverInterruptedRuns();
+startScheduler();
+const dailyBackup = () => {
+  try {
+    backupDatabaseIfDue();
+  } catch (err) {
+    console.error('Database backup failed:', err.message);
+  }
+};
+dailyBackup();
+setInterval(dailyBackup, 3600_000).unref();
+checkDefaultModel().catch(() => {});
