@@ -23,6 +23,8 @@ export const DEFAULTS = {
   autostart_prompted: false,
   // The settings file of a shared copy (copy-settings.json) that was applied, so it is applied only once.
   copy_settings_hash: '',
+  // Web version: the shared sign-in password, as a scrypt hash (src/auth.js).
+  access_password_hash: '',
 };
 
 /** Allowed ranges for numeric settings; out-of-range or non-numeric values fall back to the default. */
@@ -35,7 +37,7 @@ const NUMERIC = {
   backup_size_limit_mb: [10, 100000],
 };
 const BOOLEAN = new Set(['start_with_windows', 'catch_up_missed', 'tray_icon', 'autostart_prompted']);
-const PRIVATE = new Set(['api_key', 'heartbeat', 'key_file_hash', 'copy_settings_hash']);
+const PRIVATE = new Set(['api_key', 'heartbeat', 'key_file_hash', 'copy_settings_hash', 'access_password_hash']);
 
 const getStmt = db.prepare('SELECT value FROM settings WHERE key = ?');
 const setStmt = db.prepare('INSERT INTO settings(key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value');

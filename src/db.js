@@ -118,6 +118,16 @@ CREATE TABLE IF NOT EXISTS chat_queue (
 );
 CREATE INDEX IF NOT EXISTS chat_queue_project ON chat_queue(project_id, id);
 
+-- Signed-in browsers of the web version (src/auth.js). Only a hash of each session token is stored.
+CREATE TABLE IF NOT EXISTS sessions (
+  token_hash TEXT PRIMARY KEY,
+  created_at TEXT NOT NULL,
+  last_seen TEXT NOT NULL,
+  expires_at TEXT NOT NULL,
+  ip TEXT,
+  user_agent TEXT
+);
+
 CREATE TABLE IF NOT EXISTS memory_entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,

@@ -2,7 +2,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
+import { pipeline } from 'node:stream/promises';
 import express from 'express';
+import yazl from 'yazl';
+import { SERVER_MODE, PUBLIC_URL, PUBLIC_HOST, PUBLIC_ORIGIN, LISTEN_HOST } from './serverMode.js';
+import { mountAuth, ensurePassword } from './auth.js';
 import { APP_ROOT, DATA_DIR, LOG_DIR, RUNTIME_INFO, PROJECTS_DIR, appVersion, samePath, isInside } from './paths.js';
 import { db, backupDatabaseIfDue } from './db.js';
 import { bus, emit } from './events.js';
@@ -22,7 +26,7 @@ import {
 } from './runner.js';
 import { listConversations, conversationRuns, conversationTitle } from './conversations.js';
 import { startScheduler, refreshSchedule, removeSchedule, previewSchedule, nextRunFor, describeSchedule, scheduleToCron } from './scheduler.js';
-import { isGitRepo, restoreFolder, restorePointAvailable } from './restorePoints.js';
+import { isGitRepo, restoreFolder, restorePointAvailable, listFiles } from './restorePoints.js';
 import { testKey, listModels, pickDefaultModel } from './anthropicApi.js';
 import { setStartWithWindows, syncStartWithWindows, startWithWindowsHere } from './autostart.js';
 import { trayStatus } from './status.js';
@@ -44,16 +48,23 @@ const app = express();
 app.disable('x-powered-by');
 app.use(express.json({ limit: '5mb' }));
 
-// Only this computer's browser, on pages served by this app, may use it (protects against other websites poking at localhost).
+// On a computer only its own browser, on pages served by this app, may use it (protects against other websites poking
+// at localhost). The web version also answers its public address, behind the server's HTTPS proxy.
+const publicHost = SERVER_MODE ? PUBLIC_HOST : null;
+const publicOrigin = SERVER_MODE ? PUBLIC_ORIGIN : null;
+if (SERVER_MODE) app.set('trust proxy', 'loopback, linklocal, uniquelocal');
 app.use((req, res, next) => {
-  if (!['127.0.0.1', 'localhost'].includes(req.hostname)) return res.status(403).send('Forbidden');
+  const host = String(req.hostname ?? '').toLowerCase();
+  if (!['127.0.0.1', 'localhost'].includes(host) && host !== publicHost) return res.status(403).send('Forbidden');
   next();
 });
 app.use('/api', (req, res, next) => {
   const origin = req.get('origin');
-  if (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin)) return res.status(403).json({ error: 'Forbidden' });
+  if (origin && !/^http:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/.test(origin) && origin !== publicOrigin) return res.status(403).json({ error: 'Forbidden' });
   next();
 });
+// The web version: everybody signs in with the shared password first.
+if (SERVER_MODE) mountAuth(app);
 
 const wrap = (fn) => async (req, res) => {
   try {
@@ -67,6 +78,12 @@ const wrap = (fn) => async (req, res) => {
 };
 
 const httpError = (status, message) => Object.assign(new Error(message), { status });
+
+/** Features that act on the computer the app runs on (folders, windows) are not part of the web version. */
+function desktopOnly() {
+  if (SERVER_MODE) throw httpError(400, 'This is not available in the web version of the app.');
+}
+const KIMI_SERVER_SETUP = 'On the server, Kimi is set up once by its administrator: docker exec -it agent-runner kimi login';
 
 function requireProject(id) {
   const project = getProject(id);
@@ -185,7 +202,10 @@ async function validateFolder(folder, { create = false } = {}) {
 
 // ---------- App state & settings ----------
 
-app.get('/api/ping', (req, res) => res.json({ app: 'claude-agent-runner', version: appVersion(), pid: process.pid, root: APP_ROOT }));
+// The web version answers the health check without revealing anything about the server.
+app.get('/api/ping', (req, res) =>
+  res.json(SERVER_MODE ? { app: 'claude-agent-runner', version: appVersion() } : { app: 'claude-agent-runner', version: appVersion(), pid: process.pid, root: APP_ROOT })
+);
 
 /** Settings for the browser. "Start with Windows" shows whether the Startup entry starts THIS copy of the app. */
 const uiSettings = () => ({ ...publicSettings(), start_with_windows: getSetting('start_with_windows') && startWithWindowsHere() });
@@ -197,8 +217,10 @@ app.get('/api/state', wrap(() => {
     budget_paused: budgetPaused(),
     month_cost: monthCost(),
     version: appVersion(),
-    can_restart: process.env.RUNNER_LAUNCHER === '1',
+    can_restart: process.env.RUNNER_LAUNCHER === '1' || SERVER_MODE,
     tray_available: trayAvailable(),
+    server_mode: SERVER_MODE,
+    public_url: SERVER_MODE ? PUBLIC_URL : null,
     project_count: projects.length,
     claude_projects: projects.filter((p) => p.agent === 'claude').length,
     kimi_projects: projects.filter((p) => p.agent === 'kimi').length,
@@ -209,6 +231,8 @@ app.get('/api/settings', wrap(() => uiSettings()));
 
 app.put('/api/settings', wrap(async (req) => {
   const body = req.body ?? {};
+  // The web version has no Windows start-up, no icon next to the clock and a fixed port.
+  if (SERVER_MODE) for (const key of ['start_with_windows', 'tray_icon', 'port']) delete body[key];
   for (const [key, value] of Object.entries(body)) {
     if (key === 'api_key') {
       const v = String(value ?? '').trim();
@@ -228,7 +252,7 @@ app.put('/api/settings', wrap(async (req) => {
       setSetting(key, wanted);
       continue;
     }
-    if (key in DEFAULTS && !['heartbeat', 'budget_paused_month', 'key_file_hash', 'api_key_source', 'copy_settings_hash'].includes(key)) setSetting(key, value);
+    if (key in DEFAULTS && !['heartbeat', 'budget_paused_month', 'key_file_hash', 'api_key_source', 'copy_settings_hash', 'access_password_hash'].includes(key)) setSetting(key, value);
   }
   if (budgetPaused() && monthCost() < getSetting('monthly_cap_usd')) setSetting('budget_paused_month', '');
   // Switching the icon on starts it right away; switching it off makes it close itself within a few seconds.
@@ -254,6 +278,7 @@ app.get('/api/models', wrap(() => listModels()));
 app.post('/api/agents/kimi/setup', wrap((req) => {
   const action = req.body?.action;
   if (action !== 'install' && action !== 'login') throw httpError(400, 'Unknown action');
+  if (SERVER_MODE) throw httpError(400, KIMI_SERVER_SETUP);
   const cmd = process.env.RUNNER_KIMI_COMMAND ? null : kimiCommand();
   openPowerShellWindow(action === 'install' ? 'Install Kimi Code CLI' : 'Log in to Kimi Code CLI', kimiSetupScript(action, cmd?.command));
   invalidateKimiStatus();
@@ -274,6 +299,7 @@ app.get('/api/templates', wrap(() => ({ brief: BRIEF_TEMPLATE, task_prompt: DEFA
 app.get('/api/diagnostics', wrap(() => diagnostics()));
 
 app.post('/api/open', wrap((req) => {
+  desktopOnly();
   const what = req.body?.what;
   const target = what === 'logs' ? LOG_DIR : what === 'data' ? DATA_DIR : what === 'app' ? APP_ROOT : null;
   if (!target) throw httpError(400, 'Unknown folder');
@@ -291,23 +317,30 @@ app.get('/api/tray', wrap(() => {
 }));
 
 app.post('/api/shutdown', wrap((req, res) => {
+  // The web version is a service for everybody: it can be restarted, not switched off from the browser.
+  desktopOnly();
   res.json({ ok: true });
   setTimeout(() => shutdown(0), 200);
 }));
 
 app.post('/api/restart', wrap((req, res) => {
-  if (process.env.RUNNER_LAUNCHER !== '1') throw httpError(400, 'Restart only works when the app was started with start.bat.');
+  // On the server the container starts the app again by itself.
+  if (process.env.RUNNER_LAUNCHER !== '1' && !SERVER_MODE) throw httpError(400, 'Restart only works when the app was started with start.bat.');
   res.json({ ok: true });
   setTimeout(() => shutdown(EXIT_RESTART), 200);
 }));
 
 // ---------- Helpers for forms ----------
 
-app.post('/api/validate-folder', wrap((req) => validateFolder(req.body?.folder, { create: Boolean(req.body?.create) })));
+app.post('/api/validate-folder', wrap((req) => {
+  desktopOnly();
+  return validateFolder(req.body?.folder, { create: Boolean(req.body?.create) });
+}));
 
 app.get('/api/suggest-folder', wrap(async (req) => ({ folder: await suggestProjectFolder(String(req.query.name ?? '')) })));
 
 app.post('/api/pick-folder', wrap(async (req) => {
+  desktopOnly();
   try {
     return { folder: await pickFolder(String(req.body?.initial ?? '')) };
   } catch (err) {
@@ -352,7 +385,8 @@ app.post('/api/projects', wrap(async (req) => {
   if (!String(body.name ?? '').trim()) throw httpError(400, 'Give the project a name.');
   if (!AGENTS[body.agent]) throw httpError(400, 'Choose which agent should work on this project (Claude or Kimi).');
   checkAgentOptions(body.agent, body);
-  const folder = await validateFolder(body.folder, { create: true });
+  // In the web version the app chooses the folder: a new one in its projects folder, named after the project.
+  const folder = await validateFolder(SERVER_MODE ? uniqueFolder(PROJECTS_DIR, String(body.name)) : body.folder, { create: true });
   if (!folder.ok) throw httpError(400, folder.message);
   checkSchedule(body);
   const project = createProject({
@@ -382,6 +416,7 @@ app.put('/api/projects/:id', wrap(async (req) => {
   delete body.agent;
   checkAgentOptions(current.agent, body);
   checkSchedule({ timezone: current.timezone, ...body });
+  if (SERVER_MODE) delete body.folder;
   if (body.folder && !samePath(String(body.folder).trim().replace(/^"(.*)"$/, '$1'), current.folder)) {
     if (activeRunId(current.id)) throw httpError(409, 'Stop the active run before changing the folder.');
     const folder = await validateFolder(body.folder, { create: true });
@@ -507,6 +542,7 @@ app.post('/api/projects/:id/fresh-session', wrap((req) => {
 
 /** Moves a project folder that lives elsewhere into the app's "projects" folder, so it travels with the app. */
 app.post('/api/projects/:id/move-into-app', wrap((req) => {
+  desktopOnly();
   const p = requireProject(req.params.id);
   if (activeRunId(p.id)) throw httpError(409, 'Stop the active run before moving the folder.');
   if (isInside(p.folder, PROJECTS_DIR)) throw httpError(400, 'This project folder is already inside the app folder.');
@@ -525,9 +561,27 @@ app.post('/api/projects/:id/move-into-app', wrap((req) => {
 }));
 
 app.post('/api/projects/:id/open', wrap((req) => {
+  desktopOnly();
   const p = requireProject(req.params.id);
   const target = req.body?.target === 'index' ? path.join(p.folder, 'index.html') : p.folder;
   openPath(target);
+}));
+
+/** The project's files as a ZIP (without dependency and cache folders): how the web version hands them over. */
+app.get('/api/projects/:id/download', wrap(async (req, res) => {
+  const p = requireProject(req.params.id);
+  if (!fs.existsSync(p.folder)) throw httpError(404, 'The project folder was not found.');
+  const { files } = listFiles(p.folder);
+  const zip = new yazl.ZipFile();
+  for (const f of files) zip.addFile(f.full, f.rel, { mtime: f.mtime });
+  zip.end();
+  const name = String(p.name).replace(/[^\w .-]+/g, ' ').replace(/\s+/g, ' ').trim() || 'project';
+  res.set({
+    'Content-Type': 'application/zip',
+    'Content-Disposition': `attachment; filename="${name}.zip"; filename*=UTF-8''${encodeURIComponent(name)}.zip`,
+    'Cache-Control': 'no-store',
+  });
+  await pipeline(zip.outputStream, res);
 }));
 
 // ---------- Memory ----------
@@ -581,6 +635,7 @@ app.post('/api/projects/:id/memory/restore', wrap((req) => {
 }));
 
 app.post('/api/projects/:id/memory/export', wrap((req) => {
+  desktopOnly();
   const p = requireProject(req.params.id);
   const folder = String(req.body?.folder ?? '').trim().replace(/^"(.*)"$/, '$1');
   if (!folder || !path.isAbsolute(folder)) throw httpError(400, 'Choose a folder to export to.');
@@ -591,6 +646,7 @@ app.post('/api/projects/:id/memory/export', wrap((req) => {
 }));
 
 app.post('/api/projects/:id/memory/import', wrap((req) => {
+  desktopOnly();
   const p = requireProject(req.params.id);
   const folder = String(req.body?.folder ?? '').trim().replace(/^"(.*)"$/, '$1');
   if (!folder || !fs.existsSync(folder) || !fs.statSync(folder).isDirectory()) throw httpError(400, 'That folder does not exist.');
@@ -632,6 +688,7 @@ const shareTarget = async () => path.join(await desktopDir(), SHARE_FILE_NAME);
 
 /** Saves a ZIP of the app for another computer on the Desktop, with the Claude API key if asked (never sent back). */
 app.post('/api/share-copy', wrap(async (req) => {
+  desktopOnly();
   const includeKey = Boolean(req.body?.include_key);
   const key = getSetting('api_key');
   if (includeKey && !key) throw httpError(400, 'There is no Claude API key to include yet. Enter it under "Claude API key" first, or untick the box.');
@@ -651,6 +708,7 @@ app.post('/api/share-copy', wrap(async (req) => {
 }));
 
 app.post('/api/share-copy/show', wrap(async () => {
+  desktopOnly();
   const target = await shareTarget();
   if (!fs.existsSync(target)) throw httpError(404, 'The ZIP file is not on the Desktop any more. Create it again.');
   showInFolder(target);
@@ -659,7 +717,8 @@ app.post('/api/share-copy/show', wrap(async () => {
 // ---------- Live updates (Server-Sent Events) ----------
 
 app.get('/api/events', (req, res) => {
-  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
+  // X-Accel-Buffering: a proxy in front (nginx on the server) must pass every update on at once.
+  res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive', 'X-Accel-Buffering': 'no' });
   res.flushHeaders();
   res.write('retry: 3000\n\n');
   // Only write while the browser is still connected; a write after the connection ended would raise an error.
@@ -681,6 +740,23 @@ app.get('/api/events', (req, res) => {
 // ---------- Memory tools for agents that run as separate programs (Kimi) ----------
 
 mountMemoryMcp(app);
+
+// ---------- Website preview: the project's own files, as the web version's "Open website" ----------
+
+// The page runs in a sandbox with an origin of its own, so scripts in it cannot use the app as the signed-in visitor.
+const PREVIEW_HEADERS = {
+  'Content-Security-Policy': 'sandbox allow-scripts allow-forms allow-popups allow-modals allow-downloads',
+  'X-Content-Type-Options': 'nosniff',
+  'Cache-Control': 'no-cache',
+};
+app.use('/preview/:id', (req, res) => {
+  const p = getProject(req.params.id);
+  if (!p || !fs.existsSync(p.folder)) return res.status(404).send('This project has no files yet.');
+  res.set(PREVIEW_HEADERS);
+  express.static(p.folder, { dotfiles: 'deny', index: ['index.html'], fallthrough: false })(req, res, (err) => {
+    res.status(err?.status ?? 404).send(err?.status === 403 ? 'Not allowed' : 'Not found');
+  });
+});
 
 // ---------- Static UI ----------
 
@@ -737,18 +813,21 @@ async function existingInstance() {
 }
 
 async function listen(firstPort) {
-  for (let port = firstPort; port < firstPort + 20; port++) {
+  // On a server the port is fixed: the proxy in front expects the app exactly there.
+  const tries = SERVER_MODE ? 1 : 20;
+  for (let port = firstPort; port < firstPort + tries; port++) {
     const server = http.createServer(app);
     try {
       await new Promise((resolve, reject) => {
         server.once('error', reject);
-        server.listen(port, '127.0.0.1', resolve);
+        server.listen(port, LISTEN_HOST, resolve);
       });
       return { server, port };
     } catch (err) {
       server.close();
       if (err.code !== 'EADDRINUSE' && err.code !== 'EACCES') throw err;
       if (await pingOurs(port)) return { alreadyRunning: true, port };
+      if (SERVER_MODE) throw new Error(`Port ${port} is already in use.`);
       console.log(`Port ${port} is used by another program (or another copy of this app), trying ${port + 1}…`);
     }
   }
@@ -793,6 +872,18 @@ async function checkDefaultModel() {
 
 const portArg = args.find((a) => a.startsWith('--port='));
 const firstPort = Number(portArg?.split('=')[1]) || Number(process.env.PORT) || getSetting('port') || 4280;
+
+if (SERVER_MODE) {
+  if (!PUBLIC_HOST) {
+    console.error('The web version needs its public address: set RUNNER_PUBLIC_URL, for example https://agents.example.com.');
+    process.exit(1);
+  }
+  // The agents' home (Kimi's login, npm and git settings) can live in the data volume, which may be empty at first.
+  fs.mkdirSync(os.homedir(), { recursive: true });
+  const passwordFile = ensurePassword();
+  if (passwordFile) console.log(`A sign-in password was made and saved in ${passwordFile} (only readable on the server). Change it in Settings after signing in.`);
+  console.log(`Web version: ${PUBLIC_URL} (everybody signs in with the shared password).`);
+}
 const running = await existingInstance();
 if (running) {
   console.log(`The app is already running at ${running.url}`);

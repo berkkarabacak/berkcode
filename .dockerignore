@@ -1,0 +1,12 @@
+# Never in the image: personal data, keys, downloads made by start.bat, and things only needed for development.
+.git
+node_modules
+data
+projects
+runtime
+test
+*.key
+*.log
+*.zip
+claudeapi*.txt
+copy-settings.json

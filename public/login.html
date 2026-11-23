@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Sign in · Claude Agent Runner</title>
+  <link rel="icon" href="/icon.ico" />
+  <link rel="stylesheet" href="/style.css" />
+</head>
+<body class="login-page">
+  <main class="login">
+    <img src="/icon.png" alt="" width="52" height="52" />
+    <h1>Claude Agent Runner</h1>
+    <p class="muted">Enter the password you were given.</p>
+    <form id="login-form">
+      <input type="password" id="password" autocomplete="current-password" placeholder="Password" aria-label="Password" required autofocus />
+      <button class="primary big" type="submit">Sign in</button>
+      <div class="field-msg bad" id="login-msg" role="alert"></div>
+    </form>
+  </main>
+  <script type="module" src="/js/login.js"></script>
+</body>
+</html>

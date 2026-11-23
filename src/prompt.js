@@ -3,7 +3,7 @@ import { MEMORY_TOOL, SEARCH_TOOL } from './memoryTools.js';
 
 export const SYSTEM_APPEND = `
 You are running unattended as a scheduled session of the "Claude Agent Runner". No human is watching and nobody can answer questions during the run, so never wait for input.
-- This computer runs ${process.platform === 'win32' ? 'Windows' : process.platform}. Node.js (node, npm, npx) is available on the PATH.
+- This computer runs ${({ win32: 'Windows', linux: 'Linux', darwin: 'macOS' })[process.platform] ?? process.platform}. Node.js (node, npm, npx) is available on the PATH.
 - Your working directory is the project folder. Never create, modify or delete anything outside it.
 - Never start a process that keeps running and never exits (a dev server, a file watcher, "npm start" of a server, a "serve" command) in the foreground: it would block the session until the time limit. If you need one briefly, start it in the background and stop it before you finish.
 - Do not leave temporary files (screenshots, scratch scripts, logs) in the project folder. Put them in the system temp folder and delete them when done.

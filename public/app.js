@@ -78,6 +78,10 @@ async function refreshState() {
   state.monthCost = s.month_cost;
   state.canRestart = s.can_restart;
   state.trayAvailable = s.tray_available;
+  // The web version (on a server, with a shared password) leaves out what only works on one's own computer.
+  state.serverMode = Boolean(s.server_mode);
+  state.publicUrl = s.public_url;
+  document.body.classList.toggle('server-mode', state.serverMode);
   state.counts = { all: s.project_count, claude: s.claude_projects, kimi: s.kimi_projects };
   renderBanner();
   // Kimi projects need Kimi Code CLI on this computer (for example after copying the app to a new PC).
@@ -111,7 +115,9 @@ function renderBanner() {
   }
   const kimi = agentsCache?.kimi;
   if (counts.kimi > 0 && kimi && !(kimi.installed && kimi.loggedIn)) {
-    parts.push(`<div class="banner"><span>${kimi.installed ? 'Kimi Code CLI is not logged in on this computer' : 'Kimi Code CLI is not installed on this computer'}, so your Kimi projects cannot run. Setting it up takes a few minutes.</span><a class="btn small" href="#/settings">Set up Kimi</a></div>`);
+    parts.push(state.serverMode
+      ? `<div class="banner"><span>Kimi is not ${kimi.installed ? 'logged in' : 'installed'} on the server, so the Kimi projects cannot run. The server's administrator sets it up (see Settings).</span><a class="btn small" href="#/settings">Settings</a></div>`
+      : `<div class="banner"><span>${kimi.installed ? 'Kimi Code CLI is not logged in on this computer' : 'Kimi Code CLI is not installed on this computer'}, so your Kimi projects cannot run. Setting it up takes a few minutes.</span><a class="btn small" href="#/settings">Set up Kimi</a></div>`);
   }
   if (state.budgetPaused) {
     parts.push(`<div class="banner danger"><span><b>Monthly budget cap reached</b> (${fmtCost(state.monthCost)} of ${fmtCost(state.settings.monthly_cap_usd)}). Claude schedules are paused until next month or until you raise the cap. Kimi projects keep running (they use your subscription).</span>
@@ -127,7 +133,7 @@ function renderBanner() {
  * a Windows restart (for example an update during the night) nothing would run until someone opens the app again.
  */
 async function offerStartWithWindows() {
-  if (!state.settings || state.settings.start_with_windows || state.settings.autostart_prompted) return;
+  if (!state.settings || state.serverMode || state.settings.start_with_windows || state.settings.autostart_prompted) return;
   state.settings.autostart_prompted = true;
   api('PUT', '/api/settings', { autostart_prompted: true }).catch(() => {});
   const yes = await confirmModal(
@@ -359,7 +365,7 @@ function renderProjectHeader() {
       <nav class="top-tabs" aria-label="Project">${PROJECT_TABS.map(([k, l, ic]) => `<a href="#/project/${p.id}/${k}" class="${r.tab === k ? 'active' : ''}">${icon(ic, 14)}<span>${l}</span></a>`).join('')}</nav>
       <div class="top-actions">
         ${p.active_run_id ? '' : `<button class="ghost" id="hdr-run" title="Start a session on the standing task now">${icon('play', 13)} Run now</button>`}
-        <button class="icon-btn" id="hdr-folder" title="Open the project folder">${icon('folder', 16)}</button>
+        <button class="icon-btn" id="hdr-folder" title="${state.serverMode ? 'Download the project files (ZIP)' : 'Open the project folder'}">${icon('folder', 16)}</button>
         ${p.has_index_html ? `<button class="icon-btn" id="hdr-index" title="Open the website (index.html)">${icon('globe', 16)}</button>` : ''}
       </div>
     </div>
@@ -367,8 +373,14 @@ function renderProjectHeader() {
     ${p.paused_reason && !p.enabled ? `<div class="top-note">${esc(p.paused_reason)}</div>` : ''}`;
   $('#side-open', header).addEventListener('click', () => document.body.classList.add('side-open'));
   $('#hdr-run', header)?.addEventListener('click', () => runNow(p.id));
-  $('#hdr-folder', header).addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'folder' })));
-  $('#hdr-index', header)?.addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'index' })));
+  if (state.serverMode) {
+    // On a server the files are not on the visitor's computer: download them, or view the website in the browser.
+    $('#hdr-folder', header).addEventListener('click', () => (location.href = `/api/projects/${p.id}/download`));
+    $('#hdr-index', header)?.addEventListener('click', () => window.open(`/preview/${p.id}/`, '_blank', 'noopener'));
+  } else {
+    $('#hdr-folder', header).addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'folder' })));
+    $('#hdr-index', header)?.addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'index' })));
+  }
 }
 
 async function refreshProjectHeader() {
@@ -520,6 +532,9 @@ function agentStatusHtml(agent, info) {
       : '<span class="field-msg bad">No API key yet — add it in Settings before the first run.</span>';
   }
   const k = info.kimi;
+  if (state.serverMode && !(k.installed && k.loggedIn)) {
+    return `<span class="field-msg bad">Kimi is not ${k.installed ? 'logged in' : 'installed'} on the server yet. The server's administrator sets it up.</span>`;
+  }
   if (!k.installed) return '<span class="field-msg bad">Kimi Code CLI is not installed on this computer. <a href="#/settings">Set it up in Settings</a>.</span>';
   if (!k.loggedIn) return '<span class="field-msg bad">Kimi Code CLI is not logged in on this computer. <a href="#/settings">Log in from Settings</a>.</span>';
   return `<span class="field-msg ok">✓ Ready (version ${esc(k.version ?? '?')}) · best model: ${esc(kimiModelName(k, k.preferredModel) ?? 'default')}</span>`;
@@ -568,16 +583,16 @@ async function renderNewProject() {
       </div>
       <div id="agent-options"></div>
 
-      <label>3. Folder on this computer <span class="hint">The agent only works inside this folder. A new folder in the app's "projects" folder is suggested, so the project moves along if you ever copy the app to another computer.</span></label>
+      ${state.serverMode ? '' : `<label>3. Folder on this computer <span class="hint">The agent only works inside this folder. A new folder in the app's "projects" folder is suggested, so the project moves along if you ever copy the app to another computer.</span></label>
       <div class="row"><input type="text" name="folder" style="flex:1"/>
         <button type="button" id="browse-folder">Browse…</button></div>
-      <div class="field-msg" id="folder-msg"></div>
+      <div class="field-msg" id="folder-msg"></div>`}
 
-      <label>4. What should be built? <span class="hint">Describe it in your own words. The agent reads this at the start of every session.</span></label>
+      <label>${state.serverMode ? 3 : 4}. What should be built? <span class="hint">Describe it in your own words. The agent reads this at the start of every session.</span></label>
       <textarea name="brief" class="big" placeholder="For example: A simple personal website for me with a short introduction, my hobbies, a photo gallery and a contact section. It should look clean and work on phones."></textarea>
       <div class="muted small" style="margin-top:6px"><a href="javascript:void 0" id="use-template">Use a detailed template instead</a></div>
 
-      <h2>5. When should it work on it?</h2>
+      <h2>${state.serverMode ? 4 : 5}. When should it work on it?</h2>
       <p class="muted small" style="margin-top:-6px">You can change this any time later under Scheduled tasks.</p>
       <div id="schedule-box">${scheduleEditorHtml(null, 'Europe/Istanbul')}</div>
       <label class="inline-choice" style="margin-top:16px"><input type="checkbox" name="enabled" checked/> Turn the schedule on now</label>
@@ -611,7 +626,7 @@ async function renderNewProject() {
   });
 
   const suggest = async () => {
-    if (folderTouched) return;
+    if (folderTouched || !form.folder) return;
     const r = await api('GET', `/api/suggest-folder?name=${encodeURIComponent(form.name.value.trim() || 'My project')}`).catch(() => null);
     if (r?.folder && !folderTouched) {
       form.folder.value = r.folder;
@@ -623,9 +638,10 @@ async function renderNewProject() {
     clearTimeout(suggestTimer);
     suggestTimer = setTimeout(suggest, 300);
   });
-  form.folder.addEventListener('input', () => (folderTouched = true));
-  form.folder.addEventListener('change', () => checkFolderField(form.folder, msg));
-  $('#browse-folder').addEventListener('click', (e) =>
+  // The web version has no folder field: the app gives every project a folder of its own.
+  form.folder?.addEventListener('input', () => (folderTouched = true));
+  form.folder?.addEventListener('change', () => checkFolderField(form.folder, msg));
+  $('#browse-folder')?.addEventListener('click', (e) =>
     browseFolder(form.folder, e.currentTarget, () => {
       folderTouched = true;
       checkFolderField(form.folder, msg);
@@ -643,7 +659,7 @@ async function renderNewProject() {
     const agent = $('[name=agent]:checked', form)?.value;
     if (!agent) return toast('Choose who should do the work: Claude or Kimi', 'error');
     if (form.brief.value.trim().length < 15) return toast('Describe what should be built (a few sentences are enough)', 'error');
-    if (!(await checkFolderField(form.folder, msg))) return toast('Please fix the folder first', 'error');
+    if (form.folder && !(await checkFolderField(form.folder, msg))) return toast('Please fix the folder first', 'error');
     const { schedule, timezone } = readSchedule($('#schedule-box'));
     const submit = $('button[type=submit]', form);
     submit.disabled = true;
@@ -651,7 +667,7 @@ async function renderNewProject() {
       api('POST', '/api/projects', {
         name: form.name.value.trim(),
         agent,
-        folder: form.folder.value.trim(),
+        folder: form.folder?.value.trim(),
         brief: form.brief.value,
         task_prompt: form.task_prompt.value,
         model: form.model?.value || '',
@@ -689,7 +705,9 @@ async function renderSetupTab(el) {
       ${agentOptionsHtml(p.agent, agentsInfo, p)}
       ${!kimi && state.models?.error ? `<div class="field-msg bad">Could not load the model list: ${esc(state.models.error)}</div>` : ''}
 
-      <label>Project folder</label>
+      ${state.serverMode ? `<label>Project folder on the server</label>
+      <div class="mono small">${esc(p.folder)}</div>
+      <div class="muted small">The app chose this folder. Download its files with the folder button at the top.</div>` : `<label>Project folder</label>
       <div class="row"><input type="text" name="folder" value="${esc(p.folder)}" style="flex:1"/><button type="button" id="browse-folder">Browse…</button></div>
       <div class="field-msg ${p.folder_exists ? 'ok' : 'bad'}" id="folder-msg">${
         !p.folder_exists
@@ -700,7 +718,7 @@ async function renderSetupTab(el) {
       }</div>
       ${p.folder_exists && !p.folder_in_app ? `<div class="hint-box row" style="justify-content:space-between;margin-top:10px">
         <span class="small">This folder is outside the app folder, so copying the app folder to another computer does not take it along. Move it into the app's "projects" folder to fix that.</span>
-        <button type="button" class="small" id="move-into-app">Move into the app folder</button></div>` : ''}
+        <button type="button" class="small" id="move-into-app">Move into the app folder</button></div>` : ''}`}
 
       <label>Task prompt <span class="hint">the standing instruction that applies to every session</span></label>
       <textarea name="task_prompt" class="big">${esc(p.task_prompt)}</textarea>
@@ -729,8 +747,8 @@ async function renderSetupTab(el) {
     </div>`;
   const form = $('#setup-form');
   form.addEventListener('input', () => (state.editing = true));
-  form.folder.addEventListener('change', () => checkFolderField(form.folder, $('#folder-msg')));
-  $('#browse-folder').addEventListener('click', (e) =>
+  form.folder?.addEventListener('change', () => checkFolderField(form.folder, $('#folder-msg')));
+  $('#browse-folder')?.addEventListener('click', (e) =>
     browseFolder(form.folder, e.currentTarget, () => {
       state.editing = true;
       checkFolderField(form.folder, $('#folder-msg'));
@@ -758,7 +776,7 @@ async function renderSetupTab(el) {
     e.preventDefault();
     const body = {
       name: form.name.value.trim(),
-      folder: form.folder.value.trim(),
+      folder: form.folder?.value.trim(),
       task_prompt: form.task_prompt.value,
       model: form.model?.value ?? '',
       restore_mode: $('[name=restore_mode]:checked', form)?.value || 'zip',
@@ -793,9 +811,9 @@ async function renderSchedules() {
   view.innerHTML = `
     <div class="page-head">
       <h1>Scheduled tasks</h1>
-      <p class="muted">The agents work on these projects by themselves, at these times, and continue the project's current conversation. Scheduled sessions only happen while this app is running.</p>
+      <p class="muted">The agents work on these projects by themselves, at these times, and continue the project's current conversation. ${state.serverMode ? 'The server runs day and night, so this happens even when nobody has the app open.' : 'Scheduled sessions only happen while this app is running.'}</p>
     </div>
-    ${anyOn && !state.settings?.start_with_windows ? `<div class="hint-box row" style="justify-content:space-between;margin-bottom:16px">
+    ${anyOn && !state.serverMode && !state.settings?.start_with_windows ? `<div class="hint-box row" style="justify-content:space-between;margin-bottom:16px">
       <span>Let the app start by itself when you turn on the computer, so a restart does not stop the schedules?</span>
       <button class="small" id="enable-autostart">Yes, start with Windows</button></div>` : ''}
     ${projects.length ? `<div class="tasks">${projects.map(taskHtml).join('')}</div>` : `<div class="empty panel"><h2>No projects yet</h2><p>Add a project, then choose when its agent should work on it.</p><a class="btn primary" href="#/new">${icon('plus', 14)} Add a project</a></div>`}
@@ -845,7 +863,7 @@ function editScheduleModal(p) {
   modal(
     `<h2>When should ${esc(agentLabel(p.agent))} work on ${esc(p.name)}?</h2>
      <div id="schedule-box">${scheduleEditorHtml(p.schedule, p.timezone)}</div>
-     <p class="muted small">Scheduled sessions only happen while this app is running. If the computer was off at a scheduled time, the app runs once when it starts again (you can turn this off in Settings).</p>
+     <p class="muted small">${state.serverMode ? 'The server runs day and night, so scheduled sessions happen even when nobody has the app open.' : 'Scheduled sessions only happen while this app is running. If the computer was off at a scheduled time, the app runs once when it starts again (you can turn this off in Settings).'}</p>
      <div class="row" style="justify-content:flex-end"><button data-close>Cancel</button><button class="primary" id="save-schedule">Save schedule</button></div>`,
     (el, close) => {
       const box = $('#schedule-box', el);
@@ -1145,8 +1163,8 @@ function renderSession(box) {
       <p class="muted small">Resuming keeps the agent's conversation context. A fresh session starts with no conversation history and relies only on memory — that is safe, because memory carries the project state.</p>
       <button id="fresh-session" ${p.fresh_pending ? 'disabled' : ''}>${p.fresh_pending ? 'Fresh session requested' : 'Start fresh session'}</button>
     </div>
-    <h2>Export / import memory</h2>
-    <div class="panel">
+    <h2 class="desktop-only">Export / import memory</h2>
+    <div class="panel desktop-only">
       <label>Export all entries as Markdown files to this folder <span class="hint">must be outside the project folder</span></label>
       <div class="row"><input type="text" id="export-folder" placeholder="C:\\Users\\you\\Documents\\memory-export" style="flex:1"/><button id="export-browse">Browse…</button><button id="export-btn">Export memory</button></div>
       <label>Import Markdown files from this folder <span class="hint">files are saved as /memories/&lt;relative path&gt;; existing entries are overwritten but keep their history</span></label>
@@ -1230,7 +1248,7 @@ async function renderSettings() {
     <form id="settings-form">
       <div class="panel">
         <h2 style="margin-top:0">Claude API key</h2>
-        <p class="muted small">Create a key in the <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Claude Console</a>. Usage is billed per token to that account. The key is stored only on this computer, in the app's database.</p>
+        <p class="muted small">Create a key in the <a href="https://console.anthropic.com/settings/keys" target="_blank" rel="noopener">Claude Console</a>. Usage is billed per token to that account. The key is stored only on ${state.serverMode ? 'the server' : 'this computer'}, in the app's database, and is never shown again.</p>
         <div class="row"><input type="password" name="api_key" autocomplete="off" placeholder="${s.has_api_key ? `Saved key: ${esc(s.api_key_masked)} – type a new key to replace it` : 'Paste your key here (it starts with sk-ant-)'}" style="flex:1"/>
           <button type="button" id="test-key">Test key</button></div>
         <div class="field-msg" id="key-msg"></div>
@@ -1253,22 +1271,41 @@ async function renderSettings() {
       <div class="panel">
         <h2 style="margin-top:0">App</h2>
         <label class="inline-choice"><input type="checkbox" name="catch_up_missed" ${s.catch_up_missed ? 'checked' : ''}/> Run once at startup if a scheduled run was missed while the app was closed</label>
-        <label class="inline-choice"><input type="checkbox" name="start_with_windows" ${s.start_with_windows ? 'checked' : ''}/> Start the app automatically when I log in to Windows (runs in the background)</label>
+        <label class="inline-choice desktop-only"><input type="checkbox" name="start_with_windows" ${s.start_with_windows ? 'checked' : ''}/> Start the app automatically when I log in to Windows (runs in the background)</label>
         ${state.trayAvailable ? `<label class="inline-choice"><input type="checkbox" name="tray_icon" ${s.tray_icon ? 'checked' : ''}/> Show an icon next to the clock while the app runs (blue dot: working, red dot: needs your attention)</label>` : ''}
         <label>Backup size limit (MB) <span class="hint">zip restore points are skipped for bigger folders</span></label>
         <input type="number" name="backup_size_limit_mb" min="10" value="${esc(s.backup_size_limit_mb)}"/>
-        <label>Port <span class="hint">takes effect after restarting the app</span></label>
-        <input type="number" name="port" min="1024" max="65535" value="${esc(s.port)}"/>
+        <label class="desktop-only">Port <span class="hint">takes effect after restarting the app</span></label>
+        <input class="desktop-only" type="number" name="port" min="1024" max="65535" value="${esc(s.port)}"/>
       </div>
       <div class="row"><button class="primary" type="submit">Save settings</button></div>
     </form>
     <div class="panel" style="margin-top:24px">
       <div class="spread"><h2 style="margin-top:0">Kimi Code CLI</h2><button id="kimi-check">Check again</button></div>
-      <p class="muted small">Projects that use Kimi run on your Kimi subscription, through the Kimi Code CLI installed on this computer. There is no per-use cost and no API key. Checking does not use any of your quota.</p>
+      <p class="muted small">Projects that use Kimi run on your Kimi subscription, through the Kimi Code CLI installed on ${state.serverMode ? 'the server' : 'this computer'}. There is no per-use cost and no API key. Checking does not use any of your quota.</p>
       <dl class="kv" id="kimi-info"><dt>Checking…</dt><dd></dd></dl>
       <div class="row" id="kimi-actions" style="margin-top:12px"></div>
     </div>
-    <div class="panel" style="margin-top:24px">
+    <div class="panel server-only" style="margin-top:24px">
+      <h2 style="margin-top:0">Share the app</h2>
+      <p>Send your family and friends this address and the password: <b class="mono">${esc(state.publicUrl ?? '')}</b></p>
+      <p class="muted small">They sign in once in their browser, which then stays signed in for 30 days while they use it. Everybody sees and works on the same projects.</p>
+    </div>
+    <div class="panel server-only" style="margin-top:24px">
+      <h2 style="margin-top:0">Sign-in password</h2>
+      <p class="muted small">Everybody uses the same password. Changing it signs everybody else out; they then sign in with the new one.</p>
+      <form id="password-form">
+        <label>Current password</label>
+        <input type="password" name="current" autocomplete="current-password"/>
+        <label>New password <span class="hint">at least 8 characters</span></label>
+        <input type="password" name="password" autocomplete="new-password"/>
+        <label>New password again</label>
+        <input type="password" name="again" autocomplete="new-password"/>
+        <div class="row" style="margin-top:14px"><button class="primary" type="submit">Change password</button></div>
+        <div class="field-msg" id="password-msg"></div>
+      </form>
+    </div>
+    <div class="panel desktop-only" style="margin-top:24px">
       <h2 style="margin-top:0">Moving the app to another computer</h2>
       <p class="muted small">Everything lives in the app folder: the app, its settings and API key, the memory and run history of every project, and the project folders in its "projects" folder.</p>
       <ol class="steps">
@@ -1279,7 +1316,7 @@ async function renderSettings() {
       </ol>
       <div id="outside-projects"></div>
     </div>
-    <div class="panel" style="margin-top:24px">
+    <div class="panel desktop-only" style="margin-top:24px">
       <h2 style="margin-top:0">Share the app with family and friends</h2>
       <p class="muted small">Makes one ZIP file of this app for another computer. They unzip it and double-click <b>start.bat</b>, just like you did. Your projects, their history and your settings stay here.</p>
       <label class="inline-choice"><input type="checkbox" id="share-key" ${s.has_api_key ? 'checked' : 'disabled'}/> Include my Claude API key: they use your Anthropic account, and their Claude use is billed to you${s.has_api_key ? '' : ' (no key is saved yet)'}</label>
@@ -1293,12 +1330,13 @@ async function renderSettings() {
       <h2 style="margin-top:0">Help &amp; troubleshooting</h2>
       <dl class="kv" id="diag"><dt>Checking…</dt><dd></dd></dl>
       <div class="row" style="margin-top:14px">
-        <button id="open-logs">Open log folder</button>
-        <button id="open-data">Open data folder</button>
+        <button class="desktop-only" id="open-logs">Open log folder</button>
+        <button class="desktop-only" id="open-data">Open data folder</button>
         ${state.canRestart ? '<button id="restart">Restart app</button>' : ''}
-        <button class="danger" id="shutdown">Shut down app</button>
+        <button class="danger desktop-only" id="shutdown">Shut down app</button>
       </div>
-      <p class="muted small">Shutting down stops the app and any active run. Scheduled runs only happen while the app is running. Start it again with the "Claude Agent Runner" icon on your desktop or start.bat.</p>
+      <p class="muted small desktop-only">Shutting down stops the app and any active run. Scheduled runs only happen while the app is running. Start it again with the "Claude Agent Runner" icon on your desktop or start.bat.</p>
+      <p class="muted small server-only">Restarting stops any active run and starts the app again within a few seconds.</p>
     </div>`;
   const form = $('#settings-form');
   const testKey = async (keyText) => {
@@ -1355,6 +1393,14 @@ async function renderSettings() {
       : `<dt>Installed</dt><dd><span class="field-msg bad">Not installed on this computer.</span></dd>`;
     const actions = $('#kimi-actions');
     if (!actions) return;
+    if (state.serverMode) {
+      // The web version cannot open windows on the server: its administrator logs Kimi in once.
+      actions.innerHTML = k.installed && k.loggedIn && k.hasK31
+        ? ''
+        : '<span class="muted small">On the server, Kimi is set up by its administrator, with: <span class="mono">docker exec -it agent-runner kimi login</span></span>';
+      renderBanner();
+      return;
+    }
     actions.innerHTML = !k.installed
       ? `<button class="primary" data-kimi-setup="install">Install Kimi Code CLI</button><span class="muted small">Opens a window that installs Kimi Code CLI with its official installer, then asks you to log in with your Kimi account.</span>`
       : !k.loggedIn
@@ -1381,6 +1427,25 @@ async function renderSettings() {
   showKimi(false);
   $('#kimi-check').addEventListener('click', () => showKimi(true));
   $('#open-app').addEventListener('click', () => attempt(() => api('POST', '/api/open', { what: 'app' })));
+  $('#password-form').addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const f = e.currentTarget;
+    const out = $('#password-msg');
+    if (f.password.value !== f.again.value) {
+      out.className = 'field-msg bad';
+      out.textContent = 'The two new passwords are different.';
+      return;
+    }
+    try {
+      await api('POST', '/api/password', { current: f.current.value, password: f.password.value });
+      f.reset();
+      out.className = 'field-msg ok';
+      out.textContent = '✓ The password was changed. Everybody else signs in again with the new one.';
+    } catch (err) {
+      out.className = 'field-msg bad';
+      out.textContent = err.message;
+    }
+  });
   $('#share-make').addEventListener('click', async () => {
     const button = $('#share-make');
     const out = $('#share-result');
@@ -1500,7 +1565,11 @@ function showOffline() {
   const el = document.createElement('div');
   el.id = 'offline';
   el.className = 'offline';
-  el.innerHTML = state.shutdownRequested
+  el.innerHTML = state.serverMode
+    ? `<div class="panel"><h2>The app cannot be reached right now</h2>
+        <p>It may be restarting, or the internet connection dropped. This page reconnects by itself.</p>
+        <p>If this message stays for a long time, tell the person who gave you the address.</p></div>`
+    : state.shutdownRequested
     ? `<div class="panel"><h2>The app has been shut down</h2><p>To start it again, double-click the <b>Claude Agent Runner</b> icon on your desktop (or start.bat).</p></div>`
     : `<div class="panel"><h2>The app is not running</h2>
         <p>This page cannot reach the app. It may be restarting; this page reconnects by itself.</p>
@@ -1595,6 +1664,11 @@ window.addEventListener('beforeunload', (e) => {
   if (state.editing) e.preventDefault();
 });
 $('#side-close').addEventListener('click', () => document.body.classList.remove('side-open'));
+$('#sign-out').addEventListener('click', async (e) => {
+  e.preventDefault();
+  await fetch('/api/logout', { method: 'POST' }).catch(() => {});
+  location.href = '/login';
+});
 $('#side-backdrop').addEventListener('click', () => document.body.classList.remove('side-open'));
 
 (async function init() {

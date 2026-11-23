@@ -30,6 +30,9 @@
 
 * { box-sizing: border-box; }
 [hidden] { display: none !important; }
+/* The web version (server mode) and the app on one's own computer show a few different things. */
+body:not(.server-mode) .server-only { display: none !important; }
+body.server-mode .desktop-only { display: none !important; }
 html, body { height: 100%; }
 body { margin: 0; background: var(--bg); color: var(--text); line-height: 1.5; overflow: hidden; }
 a { color: var(--accent-dark); }
@@ -371,6 +374,16 @@ details.steps > summary:hover { color: var(--text); }
 .toast.error { background: var(--red); }
 .offline { position: fixed; inset: 0; background: rgba(250, 249, 245, .96); z-index: 200; display: flex; align-items: center; justify-content: center; text-align: center; padding: 20px; }
 .offline .panel { max-width: 520px; }
+
+/* ---------- Sign-in page (web version) ---------- */
+
+body.login-page { overflow: auto; }
+.login { max-width: 360px; margin: 14vh auto 40px; padding: 0 20px; text-align: center; }
+.login img { border-radius: 12px; }
+.login h1 { font-family: var(--serif); font-weight: 500; font-size: 28px; margin: 14px 0 6px; }
+.login form { display: flex; flex-direction: column; gap: 12px; margin-top: 24px; }
+.login input[type=password] { text-align: center; font-size: 16px; padding: 11px 12px; }
+.login button { justify-content: center; }
 
 /* ---------- Narrow windows: the sidebar slides in ---------- */
 

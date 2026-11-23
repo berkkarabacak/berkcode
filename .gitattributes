@@ -3,5 +3,9 @@
 *.bat text eol=crlf
 *.cmd text eol=crlf
 *.ps1 text eol=crlf
+# Scripts and settings for the Linux server must keep Linux line endings.
+*.sh text eol=lf
+Dockerfile text eol=lf
+deploy/** text eol=lf
 *.ico binary
 *.png binary

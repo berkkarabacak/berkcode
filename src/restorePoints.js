@@ -65,7 +65,8 @@ export function diffFingerprints(before, after) {
   return { added: added.sort(), changed: changed.sort(), removed: removed.sort() };
 }
 
-function listFiles(folder) {
+/** Every file of a folder outside the ignored folders: { files: [{ rel, full, size, mtime }], total }. */
+export function listFiles(folder) {
   const files = [];
   let total = 0;
   walk(folder, (rel, full) => {

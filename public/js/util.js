@@ -55,6 +55,11 @@ export async function api(method, url, body) {
     body: body !== undefined ? JSON.stringify(body) : undefined,
   });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401 && data.sign_in) {
+    // Web version: the session ended (for example the password was changed). Sign in again, then come back here.
+    location.href = `/login${location.hash}`;
+    throw new Error('Please sign in again.');
+  }
   if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
   return data;
 }

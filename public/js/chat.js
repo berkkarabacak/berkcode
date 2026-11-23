@@ -19,8 +19,10 @@ function scrollToBottom(force = false) {
 
 /** The project's folder shortened for the message box, e.g. "projects\My site". */
 function shortFolder(folder) {
-  const i = String(folder).toLowerCase().lastIndexOf('\\projects\\');
-  return i >= 0 ? folder.slice(i + 1) : folder;
+  const text = String(folder);
+  const lower = text.toLowerCase();
+  const i = Math.max(lower.lastIndexOf('\\projects\\'), lower.lastIndexOf('/projects/'));
+  return i >= 0 ? text.slice(i + 1) : text;
 }
 
 /** Turns absolute paths inside the project folder into short relative ones. */

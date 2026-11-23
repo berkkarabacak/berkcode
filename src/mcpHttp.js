@@ -6,6 +6,7 @@ import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/
 import {
   MEMORY_SERVER, MEMORY_DESCRIPTION, SEARCH_DESCRIPTION, memoryInputShape, searchInputShape, memoryHandlers,
 } from './memoryTools.js';
+import { SERVER_MODE, isLoopback } from './serverMode.js';
 
 const grants = new Map();
 let serverPort = null;
@@ -47,6 +48,8 @@ function buildServer(grant) {
 
 /** Adds POST /mcp/:token to the app. Stateless: every request gets a fresh server bound to the run's project. */
 export function mountMemoryMcp(app) {
+  // Only agents on this same machine use these addresses; on a server they never answer the outside world.
+  app.use('/mcp', (req, res, next) => (SERVER_MODE && !isLoopback(req.socket.remoteAddress) ? res.status(404).end() : next()));
   app.post('/mcp/:token', async (req, res) => {
     const grant = grants.get(req.params.token);
     if (!grant) {
