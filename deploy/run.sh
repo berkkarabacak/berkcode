@@ -12,6 +12,8 @@ DATA="${DATA:-/var/lib/agent-runner}"
 PORT="${PORT:-4280}"
 PUBLIC_URL="${PUBLIC_URL:-https://agents.berkkarabacak.com}"
 TZ_NAME="${TZ_NAME:-Europe/Istanbul}"
+CPUS="${CPUS:-1}"
+MEMORY="${MEMORY:-1536m}"
 
 echo "== Building $IMAGE from $APP_DIR"
 docker build --pull -t "$IMAGE" "$APP_DIR"
@@ -26,12 +28,12 @@ if docker container inspect "$NAME" >/dev/null 2>&1; then
 fi
 
 echo "== Starting $NAME on 127.0.0.1:$PORT"
-# Limits keep a shared server responsive: at most 1 CPU at low priority, 1.5 GB of memory without swap.
+# Limits keep a shared server responsive: by default at most 1 CPU at low priority, 1.5 GB of memory without swap.
 docker run -d --name "$NAME" --restart unless-stopped \
   -e RUNNER_PUBLIC_URL="$PUBLIC_URL" -e TZ="$TZ_NAME" \
   -p "127.0.0.1:$PORT:4280" \
   -v "$DATA:/data" \
-  --cpus 1 --cpu-shares 256 --memory 1536m --memory-swap 1536m --pids-limit 512 \
+  --cpus "$CPUS" --cpu-shares 256 --memory "$MEMORY" --memory-swap "$MEMORY" --pids-limit 512 \
   --security-opt no-new-privileges --cap-drop ALL \
   --log-opt max-size=10m --log-opt max-file=3 \
   "$IMAGE" >/dev/null

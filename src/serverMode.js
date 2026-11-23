@@ -1,5 +1,5 @@
 // Server mode: the app runs on a server for several people, behind HTTPS, instead of on one person's own computer.
-// Turned on with RUNNER_SERVER=1 (see deploy/README.md). Everyone signs in with one shared password (src/auth.js),
+// Turned on with RUNNER_SERVER=1 (see deploy/HANDOVER.md). Everyone signs in with one shared password (src/auth.js),
 // and the features that only make sense on the owner's Windows computer are switched off.
 export const SERVER_MODE = process.env.RUNNER_SERVER === '1';
 

@@ -1,4 +1,4 @@
-# Claude Agent Runner, web version (server mode). See deploy/README.md.
+# Claude Agent Runner, web version (server mode). See deploy/HANDOVER.md.
 # Everything that must survive an update lives in the /data volume: the app's database and backups, the projects,
 # and the agents' home (Kimi's login and sessions, npm and git settings). The app's code is read-only for the app.
 FROM node:24-bookworm-slim
