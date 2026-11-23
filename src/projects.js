@@ -1,8 +1,43 @@
+import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { db, now } from './db.js';
 import { getSetting } from './settings.js';
+import { APP_ROOT, PROJECTS_DIR, isInside, canonicalPath } from './paths.js';
 
+/**
+ * Folders inside the app folder are stored relative to it, so the app folder can be copied to another
+ * computer (or another place) and every project still finds its folder.
+ */
+export function storeFolder(folder) {
+  const abs = path.resolve(String(folder));
+  return isInside(abs, APP_ROOT) ? path.relative(APP_ROOT, canonicalPath(abs)) : abs;
+}
+
+/** Turns a stored folder back into a full path. Also finds folders that moved along with a Windows user folder. */
+export function resolveFolder(stored) {
+  if (!stored) return stored;
+  if (!path.isAbsolute(stored)) return path.join(APP_ROOT, stored);
+  if (fs.existsSync(stored)) return stored;
+  // Copied to another computer: try the same place inside this user's folder (C:\Users\<someone else>\...).
+  const match = stored.match(/^[a-zA-Z]:[\\/]Users[\\/][^\\/]+[\\/](.+)$/);
+  if (match) {
+    const candidate = path.join(os.homedir(), match[1]);
+    if (fs.existsSync(candidate)) return candidate;
+  }
+  return stored;
+}
+
+/** The agents a project can use. The agent is chosen when a project is created and cannot be changed. */
+export const AGENTS = {
+  claude: { id: 'claude', label: 'Claude', long: 'Claude (Anthropic API key)', billing: 'api' },
+  kimi: { id: 'kimi', label: 'Kimi', long: 'Kimi Code CLI (your Kimi subscription)', billing: 'subscription' },
+};
+export const KIMI_EFFORTS = ['low', 'high', 'max'];
+
+// Columns the owner may change after creation. "agent" is deliberately not here.
 const COLUMNS = [
-  'name', 'folder', 'task_prompt', 'model', 'schedule', 'timezone', 'enabled', 'restore_mode',
+  'name', 'folder', 'task_prompt', 'model', 'effort', 'schedule', 'timezone', 'enabled', 'restore_mode',
   'fresh_every', 'turn_limit', 'budget_usd', 'max_minutes',
 ];
 
@@ -14,7 +49,17 @@ function hydrate(row) {
   } catch {
     schedule = { type: 'daily', time: '09:00' };
   }
-  return { ...row, schedule, enabled: Boolean(row.enabled), fresh_pending: Boolean(row.fresh_pending) };
+  const agent = AGENTS[row.agent] ? row.agent : 'claude';
+  const folder = resolveFolder(row.folder);
+  return {
+    ...row,
+    folder,
+    folder_in_app: Boolean(folder) && isInside(folder, PROJECTS_DIR),
+    agent,
+    schedule,
+    enabled: Boolean(row.enabled),
+    fresh_pending: Boolean(row.fresh_pending),
+  };
 }
 
 export function getProject(id) {
@@ -27,23 +72,29 @@ export function listProjects() {
 
 function serialize(key, value) {
   if (key === 'schedule') return JSON.stringify(value);
+  if (key === 'folder') return storeFolder(value);
   if (key === 'enabled') return value ? 1 : 0;
   if (['fresh_every', 'turn_limit', 'max_minutes'].includes(key)) return value === '' || value == null ? null : Math.max(1, Math.round(Number(value)));
   if (key === 'budget_usd') return value === '' || value == null ? null : Math.max(0.01, Number(value));
-  return value == null ? null : String(value);
+  if (key === 'effort') return KIMI_EFFORTS.includes(value) ? value : null;
+  return value == null || value === '' ? null : String(value);
 }
 
 export function createProject(data) {
+  const agent = AGENTS[data.agent] ? data.agent : null;
+  if (!agent) throw new Error('Choose which agent should work on the project.');
   const res = db
     .prepare(
-      `INSERT INTO projects(name, folder, task_prompt, model, schedule, timezone, enabled, restore_mode, fresh_every, created_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+      `INSERT INTO projects(name, folder, task_prompt, agent, model, effort, schedule, timezone, enabled, restore_mode, fresh_every, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
     )
     .run(
       data.name || 'New project',
-      data.folder,
+      storeFolder(data.folder),
       data.task_prompt ?? '',
+      agent,
       data.model || null,
+      agent === 'kimi' ? serialize('effort', data.effort ?? 'max') : null,
       JSON.stringify(data.schedule ?? { type: 'daily', time: '09:00' }),
       data.timezone || 'Europe/Istanbul',
       data.enabled ? 1 : 0,
@@ -83,12 +134,17 @@ export function deleteProject(id) {
   db.prepare('DELETE FROM projects WHERE id = ?').run(Number(id));
 }
 
-/** Effective per-run limits: project overrides, else global defaults. */
+/**
+ * Effective per-run limits: project overrides, else global defaults.
+ * Kimi runs have no dollar budget (subscription); their model is resolved at run time when not set.
+ */
 export function effectiveLimits(project) {
+  const kimi = project.agent === 'kimi';
   return {
-    model: project.model || getSetting('default_model'),
+    model: kimi ? project.model || null : project.model || getSetting('default_model'),
+    effort: kimi ? project.effort || 'max' : null,
     maxTurns: project.turn_limit || getSetting('default_turn_limit'),
-    budgetUsd: project.budget_usd || getSetting('default_budget_usd'),
+    budgetUsd: kimi ? null : project.budget_usd || getSetting('default_budget_usd'),
     maxMinutes: project.max_minutes || getSetting('default_max_minutes'),
   };
 }

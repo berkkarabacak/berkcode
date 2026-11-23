@@ -76,6 +76,9 @@ const fmtDuration = (ms) => {
   if (m < 60) return `${m}m ${s % 60}s`;
   return `${Math.floor(m / 60)}h ${m % 60}m`;
 };
+const agentBadge = (agent) => `<span class="agent-badge ${agent === 'kimi' ? 'kimi' : 'claude'}">${agent === 'kimi' ? 'Kimi' : 'Claude'}</span>`;
+/** Kimi runs are covered by the subscription, so they show no dollar cost. */
+const runCost = (agent, value) => (agent === 'kimi' ? 'Subscription' : fmtCost(value));
 const statusChip = (s) => `<span class="status ${esc(s)}">${esc(String(s).replace('_', ' '))}</span>`;
 const timeAgo = (iso) => {
   if (!iso) return '';
@@ -183,21 +186,48 @@ async function refreshState() {
   state.budgetPaused = s.budget_paused;
   state.monthCost = s.month_cost;
   state.canRestart = s.can_restart;
+  state.counts = { all: s.project_count, claude: s.claude_projects, kimi: s.kimi_projects };
   renderBanner();
+  // Kimi projects need Kimi Code CLI on this computer (for example after copying the app to a new PC).
+  if (s.kimi_projects > 0 && Date.now() - (state.kimiCheckedAt ?? 0) > 120_000) {
+    state.kimiCheckedAt = Date.now();
+    loadAgents(false).then(renderBanner);
+  }
 }
 
 function renderBanner() {
   const b = $('#banner');
   const parts = [];
-  if (state.settings && !state.settings.has_api_key) {
-    parts.push(`<div class="banner"><span>No Claude API key is set yet. Runs cannot start until you add one.</span><a class="btn small" href="#/settings">Open Settings</a></div>`);
+  const counts = state.counts ?? { all: 0, claude: 0, kimi: 0 };
+  if (state.settings && !state.settings.has_api_key && (counts.claude > 0 || counts.all === 0)) {
+    parts.push(counts.claude > 0
+      ? `<div class="banner"><span>No Claude API key is set yet, so your Claude projects cannot run. Add the key in Settings.</span><a class="btn small" href="#/settings">Open Settings</a></div>`
+      : `<div class="banner"><span>To use Claude, add your Claude API key in Settings. (Projects that use Kimi do not need it.)</span><a class="btn small" href="#/settings">Open Settings</a></div>`);
+  }
+  let recovered = null;
+  try {
+    recovered = state.settings?.db_recovered ? JSON.parse(state.settings.db_recovered) : null;
+  } catch {
+    /* ignore */
+  }
+  if (recovered) {
+    parts.push(`<div class="banner danger"><span><b>The app's database was damaged</b> (this can happen when the app folder is copied while the app is running), so the app ${
+      recovered.from
+        ? `went back to its daily backup from ${esc(recovered.from.slice(4, 14))}. Runs and memory changes made after that backup are missing`
+        : 'had to start with a new, empty database'
+    }. The damaged file was kept in the data folder as ${esc(recovered.damaged)}.</span><button class="small" id="db-recovered-ok">OK</button></div>`);
+  }
+  const kimi = agentsCache?.kimi;
+  if (counts.kimi > 0 && kimi && !(kimi.installed && kimi.loggedIn)) {
+    parts.push(`<div class="banner"><span>${kimi.installed ? 'Kimi Code CLI is not logged in on this computer' : 'Kimi Code CLI is not installed on this computer'}, so your Kimi projects cannot run. Setting it up takes a few minutes.</span><a class="btn small" href="#/settings">Set up Kimi</a></div>`);
   }
   if (state.budgetPaused) {
-    parts.push(`<div class="banner danger"><span><b>Monthly budget cap reached</b> (${fmtCost(state.monthCost)} of ${fmtCost(state.settings.monthly_cap_usd)}). All schedules are paused until next month or until you raise the cap.</span>
+    parts.push(`<div class="banner danger"><span><b>Monthly budget cap reached</b> (${fmtCost(state.monthCost)} of ${fmtCost(state.settings.monthly_cap_usd)}). Claude schedules are paused until next month or until you raise the cap. Kimi projects keep running (they use your subscription).</span>
       <a class="btn small" href="#/settings">Change cap</a><button class="small" id="resume-budget">Resume schedules</button></div>`);
   }
   b.innerHTML = parts.join('');
   $('#resume-budget')?.addEventListener('click', () => attempt(() => api('POST', '/api/budget/resume'), 'Schedules resumed').then(refreshState));
+  $('#db-recovered-ok')?.addEventListener('click', () => attempt(() => api('PUT', '/api/settings', { db_recovered: '' })).then(refreshState));
 }
 
 function setNav(name) {
@@ -261,15 +291,16 @@ async function renderDashboard() {
     .map((p) => {
       const scheduleState = p.active_run_id ? statusChip('running') : p.enabled ? '<span class="status active">scheduled</span>' : '<span class="status paused">paused</span>';
       return `<div class="card">
-        <div class="spread"><h3><a href="#/project/${p.id}">${esc(p.name)}</a></h3>${scheduleState}</div>
+        <div class="spread"><h3><a href="#/project/${p.id}">${esc(p.name)}</a> ${agentBadge(p.agent)}</h3>${scheduleState}</div>
         <dl>
           <dt>Schedule</dt><dd>${esc(p.schedule_text)}</dd>
-          <dt>Next run</dt><dd>${p.enabled ? (state.budgetPaused ? 'Paused (budget cap)' : esc(fmtTime(p.next_run, p.timezone))) : 'Paused'}</dd>
+          <dt>Next run</dt><dd>${p.enabled ? (state.budgetPaused && p.billing === 'api' ? 'Paused (budget cap)' : esc(fmtTime(p.next_run, p.timezone))) : 'Paused'}</dd>
           <dt>Last run</dt><dd>${p.last_run ? `${statusChip(p.last_run.status)} <span class="muted small">${esc(timeAgo(p.last_run.started_at))}</span>` : '<span class="muted">Never</span>'}</dd>
-          <dt>Last run cost</dt><dd>${fmtCost(p.last_run?.cost_usd)}</dd>
-          <dt>This month</dt><dd>${fmtCost(p.month_cost)}</dd>
+          <dt>Last run cost</dt><dd>${p.last_run ? runCost(p.agent, p.last_run.cost_usd) : '—'}</dd>
+          <dt>This month</dt><dd>${runCost(p.agent, p.month_cost)}</dd>
         </dl>
         ${p.paused_reason ? `<div class="warn">${esc(p.paused_reason)}</div>` : ''}
+        ${p.folder_exists ? '' : `<div class="warn">The project folder was not found on this computer. Open the project and choose where its folder is in the Setup tab.</div>`}
         <div class="row">
           ${p.active_run_id ? `<button data-stop="${p.id}" class="danger">Stop run</button>` : `<button class="primary" data-run="${p.id}">Run now</button>`}
           <button data-toggle="${p.id}" data-enabled="${p.enabled ? 1 : 0}">${p.enabled ? 'Pause schedule' : 'Resume schedule'}</button>
@@ -285,7 +316,7 @@ async function renderDashboard() {
     ${projects.some((p) => p.enabled) && !state.settings?.start_with_windows ? `<div class="hint-box row" style="margin-bottom:16px;justify-content:space-between">
       <span>Scheduled runs only happen while this app is running. Let it start by itself when you turn on the computer?</span>
       <button class="small" id="enable-autostart">Yes, start with Windows</button></div>` : ''}
-    ${projects.length ? `<div class="cards">${cards}</div>` : `<div class="empty panel"><h2>No projects yet</h2><p>Add a project, describe what you want built, and Claude will work on it step by step on your schedule.</p><a class="btn primary big" href="#/new">+ Add your first project</a></div>`}`;
+    ${projects.length ? `<div class="cards">${cards}</div>` : `<div class="empty panel"><h2>No projects yet</h2><p>Add a project, describe what you want built, and the agent you choose (Claude or Kimi) will work on it step by step on your schedule.</p><a class="btn primary big" href="#/new">+ Add your first project</a></div>`}`;
 
   $('#enable-autostart')?.addEventListener('click', async () => {
     if (await attempt(() => api('PUT', '/api/settings', { start_with_windows: true }), 'The app will now start by itself when you log in to Windows.')) {
@@ -327,25 +358,34 @@ const TIMEZONES = (() => {
   }
 })();
 
+/** Regular repeat intervals (minutes). They divide an hour or a day evenly, so the rhythm never drifts. */
+const INTERVALS = [15, 30, 60, 120, 180, 240, 360, 480, 720];
+const intervalLabel = (m) => (m < 60 ? `${m} minutes` : m === 60 ? '1 hour' : `${m / 60} hours`);
+
 function scheduleEditorHtml(schedule, timezone) {
-  const s = schedule || { type: 'daily', time: '09:00' };
-  const type = s.type || 'daily';
+  let s = schedule || { type: 'daily', time: '09:00' };
+  // Older projects saved "every N hours"; show them as the equivalent interval when possible.
+  if (s.type === 'hours' && INTERVALS.includes(Number(s.every) * 60)) s = { type: 'interval', minutes: Number(s.every) * 60 };
+  const type = s.type === 'hours' ? 'cron' : s.type || 'daily';
+  const expr = s.type === 'hours' ? `0 */${s.every} * * *` : s.expr ?? '';
+  const minutes = Number(s.minutes ?? 60);
   const days = new Set(s.days ?? [1, 2, 3, 4, 5]);
   return `
     <div class="schedule-editor">
       <div class="inline-choice">
-        ${[['hours', 'Every few hours'], ['daily', 'Every day'], ['weekdays', 'On selected weekdays'], ['cron', 'Advanced']]
+        ${[['interval', 'Repeat every…'], ['daily', 'Every day'], ['weekdays', 'On selected weekdays'], ['cron', 'Advanced']]
           .map(([v, l]) => `<label><input type="radio" name="stype" value="${v}" ${type === v ? 'checked' : ''}/> ${l}</label>`)
           .join('')}
       </div>
-      <div data-s="hours" class="row" style="margin-top:12px">Run every <input type="number" name="every" min="1" max="24" value="${esc(s.every ?? 4)}" style="width:80px"/> hours</div>
+      <div data-s="interval" class="row" style="margin-top:12px">Repeat every
+        <select name="interval" style="width:auto">${INTERVALS.map((m) => `<option value="${m}" ${m === minutes ? 'selected' : ''}>${intervalLabel(m)}</option>`).join('')}</select></div>
       <div data-s="daily" class="row" style="margin-top:12px">Run every day at <input type="time" name="time_daily" value="${esc(s.time ?? '09:00')}"/></div>
       <div data-s="weekdays" style="margin-top:12px">
         <div class="inline-choice days">${DAY_LABELS.map((d, i) => `<label><input type="checkbox" name="day" value="${i}" ${days.has(i) ? 'checked' : ''}/> ${d}</label>`).join('')}</div>
         <div class="row" style="margin-top:10px">at <input type="time" name="time_weekdays" value="${esc(s.time ?? '09:00')}"/></div>
       </div>
       <div data-s="cron" style="margin-top:12px">
-        <input type="text" name="expr" placeholder="minute hour day month weekday, e.g. 0 9 * * 1-5" value="${esc(s.expr ?? '')}"/>
+        <input type="text" name="expr" placeholder="minute hour day month weekday, e.g. 0 9 * * 1-5" value="${esc(expr)}"/>
         <div class="muted small">Standard cron syntax with 5 fields. Only for advanced use.</div>
       </div>
       <label>Timezone</label>
@@ -359,7 +399,7 @@ function readSchedule(root) {
   const type = $('[name=stype]:checked', root)?.value || 'daily';
   const timezone = $('[name=timezone]', root).value.trim() || 'Europe/Istanbul';
   let schedule;
-  if (type === 'hours') schedule = { type, every: Number($('[name=every]', root).value) || 1, minute: 0 };
+  if (type === 'interval') schedule = { type, minutes: Number($('[name=interval]', root).value) || 60 };
   else if (type === 'daily') schedule = { type, time: $('[name=time_daily]', root).value || '09:00' };
   else if (type === 'weekdays') schedule = { type, time: $('[name=time_weekdays]', root).value || '09:00', days: $$('[name=day]:checked', root).map((c) => Number(c.value)) };
   else schedule = { type: 'cron', expr: $('[name=expr]', root).value.trim() };
@@ -416,27 +456,83 @@ async function checkFolderField(input, msg) {
   return r.ok;
 }
 
+// ---- Agents (Claude or Kimi) ----
+
+let agentsCache = null;
+async function loadAgents(refresh = false) {
+  if (!agentsCache || refresh) agentsCache = await api('GET', `/api/agents${refresh ? '?refresh=1' : ''}`).catch(() => null);
+  return agentsCache;
+}
+
+const kimiModelName = (kimi, id) => kimi?.models?.find((m) => m.id === id)?.name ?? id;
+
+function agentStatusHtml(agent, info) {
+  if (!info) return '<span class="muted">Checking…</span>';
+  if (agent === 'claude') {
+    return info.claude.ready
+      ? '<span class="field-msg ok">✓ API key is set</span>'
+      : '<span class="field-msg bad">No API key yet — add it in Settings before the first run.</span>';
+  }
+  const k = info.kimi;
+  if (!k.installed) return '<span class="field-msg bad">Kimi Code CLI is not installed on this computer. <a href="#/settings">Set it up in Settings</a>.</span>';
+  if (!k.loggedIn) return '<span class="field-msg bad">Kimi Code CLI is not logged in on this computer. <a href="#/settings">Log in from Settings</a>.</span>';
+  return `<span class="field-msg ok">✓ Ready (version ${esc(k.version ?? '?')}) · best model: ${esc(kimiModelName(k, k.preferredModel) ?? 'default')}</span>`;
+}
+
+/** Model (and, for Kimi, thinking effort) fields for the chosen agent. */
+function agentOptionsHtml(agent, info, project = {}) {
+  if (agent === 'claude') {
+    const models = info?.claude?.models ?? state.models?.models ?? [];
+    return `<label>Claude model</label><select name="model">${modelOptions(models, project.model || '', true)}</select>`;
+  }
+  const kimi = info?.kimi;
+  const models = kimi?.models ?? [];
+  const best = kimi?.preferredModel ? kimiModelName(kimi, kimi.preferredModel) : 'Kimi default';
+  const current = project.model || '';
+  const options = [`<option value="">Best available (${esc(best)})</option>`]
+    .concat(current && !models.some((m) => m.id === current) ? [`<option value="${esc(current)}" selected>${esc(current)}</option>`] : [])
+    .concat(models.map((m) => `<option value="${esc(m.id)}" ${m.id === current ? 'selected' : ''}>${esc(m.name)} (${esc(m.id)})</option>`));
+  const effort = project.effort || 'max';
+  return `<div class="row" style="gap:28px;align-items:flex-start">
+      <div><label>Kimi model</label><select name="model">${options.join('')}</select>
+        ${kimi && kimi.loggedIn && !kimi.hasK31 ? '<div class="muted small">K3.1 Pro is not in your Kimi model list yet. In Kimi, type /logout and then /login to refresh it.</div>' : ''}</div>
+      <div><label>Thinking</label><select name="effort">${['max', 'high', 'low'].map((e) => `<option value="${e}" ${e === effort ? 'selected' : ''}>${e === 'max' ? 'Max (best results)' : e === 'high' ? 'High' : 'Low (fastest)'}</option>`).join('')}</select></div>
+    </div>`;
+}
+
 async function renderNewProject() {
   const stale = routeGuard();
-  const [models, templates] = await Promise.all([loadModels(), api('GET', '/api/templates')]);
+  const [templates] = await Promise.all([api('GET', '/api/templates'), loadModels()]);
   if (stale()) return;
   view.innerHTML = `
     <h1>Add a project</h1>
-    <p class="muted">Set this up once. Claude will then work on the project on your schedule, one step at a time.</p>
+    <p class="muted">Set this up once. The agent you choose will then work on the project on your schedule, one step at a time.</p>
     <form id="new-form" class="panel">
       <label>1. Project name</label>
       <input type="text" name="name" placeholder="For example: My website" required autofocus/>
 
-      <label>2. Folder on this computer <span class="hint">Claude only works inside this folder. A new folder is suggested for you.</span></label>
+      <label>2. Who should do the work? <span class="hint">You choose this once. It cannot be changed later.</span></label>
+      <div class="agent-choices">
+        <label class="agent-card"><input type="radio" name="agent" value="claude"/>
+          <div><b>Claude</b> <span class="muted small">· uses your Anthropic API key · you pay per use</span>
+          <div class="small" data-agent-status="claude"><span class="muted">Checking…</span></div></div></label>
+        <label class="agent-card"><input type="radio" name="agent" value="kimi"/>
+          <div><b>Kimi Code CLI</b> <span class="muted small">· uses your Kimi subscription · no per-use cost</span>
+          <div class="small" data-agent-status="kimi"><span class="muted">Checking Kimi…</span></div></div></label>
+      </div>
+      <div id="agent-options"></div>
+
+      <label>3. Folder on this computer <span class="hint">The agent only works inside this folder. A new folder in the app's "projects" folder is suggested, so the project moves along if you ever copy the app to another computer.</span></label>
       <div class="row"><input type="text" name="folder" style="flex:1"/>
         <button type="button" id="browse-folder">Browse…</button></div>
       <div class="field-msg" id="folder-msg"></div>
 
-      <label>3. What should Claude build? <span class="hint">Describe it in your own words. Claude reads this at the start of every session.</span></label>
+      <label>4. What should be built? <span class="hint">Describe it in your own words. The agent reads this at the start of every session.</span></label>
       <textarea name="brief" class="big" placeholder="For example: A simple personal website for me with a short introduction, my hobbies, a photo gallery and a contact section. It should look clean and work on phones."></textarea>
       <div class="muted small" style="margin-top:6px"><a href="javascript:void 0" id="use-template">Use a detailed template instead</a></div>
 
-      <h2>4. When should Claude work on it?</h2>
+      <h2>5. When should it work on it?</h2>
+      <p class="muted small" style="margin-top:-6px">You can change this any time later in the project's Schedule tab.</p>
       <div id="schedule-box">${scheduleEditorHtml(null, 'Europe/Istanbul')}</div>
       <label class="inline-choice" style="margin-top:16px"><input type="checkbox" name="enabled" checked/> Turn the schedule on now</label>
 
@@ -444,8 +540,6 @@ async function renderNewProject() {
         <summary>Advanced options</summary>
         <label>Standing instruction for every session</label>
         <textarea name="task_prompt">${esc(templates.task_prompt)}</textarea>
-        <label>Model</label>
-        <select name="model">${modelOptions(models, '', true)}</select>
       </details>
 
       <div class="row" style="margin-top:22px"><button class="primary big" type="submit">Create project</button><a class="btn" href="#/">Cancel</a></div>
@@ -455,6 +549,20 @@ async function renderNewProject() {
   const form = $('#new-form');
   const msg = $('#folder-msg');
   let folderTouched = false;
+  let agentsInfo = null;
+
+  const showAgentOptions = () => {
+    const agent = $('[name=agent]:checked', form)?.value;
+    $$('.agent-card', form).forEach((card) => card.classList.toggle('selected', $('input', card).checked));
+    $('#agent-options').innerHTML = agent ? agentOptionsHtml(agent, agentsInfo) : '';
+  };
+  $$('[name=agent]', form).forEach((r) => r.addEventListener('change', showAgentOptions));
+  loadAgents(true).then((info) => {
+    if (stale()) return;
+    agentsInfo = info;
+    for (const agent of ['claude', 'kimi']) $(`[data-agent-status=${agent}]`, form).innerHTML = agentStatusHtml(agent, info);
+    showAgentOptions();
+  });
 
   const suggest = async () => {
     if (folderTouched) return;
@@ -486,7 +594,9 @@ async function renderNewProject() {
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     if (!form.name.value.trim()) return toast('Give the project a name', 'error');
-    if (form.brief.value.trim().length < 15) return toast('Describe what Claude should build (a few sentences are enough)', 'error');
+    const agent = $('[name=agent]:checked', form)?.value;
+    if (!agent) return toast('Choose who should do the work: Claude or Kimi', 'error');
+    if (form.brief.value.trim().length < 15) return toast('Describe what should be built (a few sentences are enough)', 'error');
     if (!(await checkFolderField(form.folder, msg))) return toast('Please fix the folder first', 'error');
     const { schedule, timezone } = readSchedule($('#schedule-box'));
     const submit = $('button[type=submit]', form);
@@ -494,10 +604,12 @@ async function renderNewProject() {
     const p = await attempt(() =>
       api('POST', '/api/projects', {
         name: form.name.value.trim(),
+        agent,
         folder: form.folder.value.trim(),
         brief: form.brief.value,
         task_prompt: form.task_prompt.value,
-        model: form.model.value,
+        model: form.model?.value || '',
+        effort: form.effort?.value || undefined,
         schedule,
         timezone,
         enabled: form.enabled.checked,
@@ -546,8 +658,8 @@ function renderProjectHeader() {
   header.innerHTML = `
     <div class="spread">
       <div>
-        <h1>${esc(p.name)}</h1>
-        <div class="muted small">${esc(p.folder)} · ${esc(p.schedule_text)} · ${p.enabled ? `next run ${esc(fmtTime(p.next_run, p.timezone))}` : 'schedule paused'} · this month ${fmtCost(p.month_cost)}</div>
+        <h1>${esc(p.name)} ${agentBadge(p.agent)}</h1>
+        <div class="muted small">${esc(p.folder)} · ${esc(p.schedule_text)} · ${p.enabled ? `next run ${esc(fmtTime(p.next_run, p.timezone))}` : 'schedule paused'} · ${p.agent === 'kimi' ? 'uses your Kimi subscription' : `this month ${fmtCost(p.month_cost)}`}</div>
         ${p.paused_reason ? `<div class="field-msg bad">${esc(p.paused_reason)}</div>` : ''}
       </div>
       <div class="row">
@@ -579,23 +691,35 @@ async function refreshProjectHeader() {
 
 async function renderSetupTab(el) {
   const p = state.project;
-  const models = await loadModels();
+  const [, agentsInfo] = await Promise.all([loadModels(), loadAgents()]);
   const s = state.settings;
+  const kimi = p.agent === 'kimi';
   el.innerHTML = `
     <form id="setup-form" class="panel">
       <label>Project name</label>
       <input type="text" name="name" value="${esc(p.name)}"/>
 
+      <label>Agent</label>
+      <div class="hint-box">${agentBadge(p.agent)} <b>${esc(p.agent_long)}</b><br/>
+        <span class="muted small">The agent is chosen when a project is created and cannot be changed. To use another agent, create a new project.</span></div>
+      ${agentOptionsHtml(p.agent, agentsInfo, p)}
+      ${!kimi && state.models?.error ? `<div class="field-msg bad">Could not load the model list: ${esc(state.models.error)}</div>` : ''}
+
       <label>Project folder</label>
       <div class="row"><input type="text" name="folder" value="${esc(p.folder)}" style="flex:1"/><button type="button" id="browse-folder">Browse…</button></div>
-      <div class="field-msg ${p.folder_exists ? 'ok' : 'bad'}" id="folder-msg">${p.folder_exists ? 'Folder exists.' : 'This folder does not exist.'}</div>
+      <div class="field-msg ${p.folder_exists ? 'ok' : 'bad'}" id="folder-msg">${
+        !p.folder_exists
+          ? 'This folder was not found on this computer. If the app was copied from another computer, copy the project folder too, or choose where it is now with Browse… and press Save.'
+          : p.folder_in_app
+            ? 'Folder found. It is inside the app folder, so it moves along when you copy the app to another computer.'
+            : 'Folder found.'
+      }</div>
+      ${p.folder_exists && !p.folder_in_app ? `<div class="hint-box row" style="justify-content:space-between;margin-top:10px">
+        <span class="small">This folder is outside the app folder, so copying the app folder to another computer does not take it along. Move it into the app's "projects" folder to fix that.</span>
+        <button type="button" class="small" id="move-into-app">Move into the app folder</button></div>` : ''}
 
       <label>Task prompt <span class="hint">the standing instruction that applies to every session</span></label>
       <textarea name="task_prompt" class="big">${esc(p.task_prompt)}</textarea>
-
-      <label>Model</label>
-      <select name="model">${modelOptions(models, p.model || '', true)}</select>
-      ${state.models?.error ? `<div class="field-msg bad">Could not load the model list: ${esc(state.models.error)}</div>` : ''}
 
       <label>Restore points <span class="hint">taken before every run so you can undo it</span></label>
       <div class="inline-choice">
@@ -605,12 +729,12 @@ async function renderSetupTab(el) {
 
       <h2>Limits per run</h2>
       <div class="row" style="gap:28px">
-        <div><label>Turn limit</label><input type="number" name="turn_limit" min="1" value="${esc(p.turn_limit ?? '')}" placeholder="${esc(s.default_turn_limit)}"/></div>
-        <div><label>Budget (USD)</label><input type="number" name="budget_usd" min="0.1" step="0.1" value="${esc(p.budget_usd ?? '')}" placeholder="${esc(s.default_budget_usd)}"/></div>
+        <div><label>Step limit</label><input type="number" name="turn_limit" min="1" value="${esc(p.turn_limit ?? '')}" placeholder="${esc(s.default_turn_limit)}"/></div>
+        ${kimi ? '' : `<div><label>Budget (USD)</label><input type="number" name="budget_usd" min="0.1" step="0.1" value="${esc(p.budget_usd ?? '')}" placeholder="${esc(s.default_budget_usd)}"/></div>`}
         <div><label>Time limit (minutes)</label><input type="number" name="max_minutes" min="1" value="${esc(p.max_minutes ?? '')}" placeholder="${esc(s.default_max_minutes)}"/></div>
         <div><label>Fresh session every N runs</label><input type="number" name="fresh_every" min="1" value="${esc(p.fresh_every)}"/></div>
       </div>
-      <p class="muted small">Leave a limit empty to use the default from Settings.</p>
+      <p class="muted small">Leave a limit empty to use the default from Settings.${kimi ? ' Kimi runs use your subscription, so there is no dollar budget per run.' : ''}${kimi ? ' Changing the model or thinking level starts a fresh Kimi session on the next run.' : ''}</p>
 
       <div class="row" style="margin-top:18px"><button class="primary" type="submit">Save</button></div>
     </form>
@@ -628,19 +752,38 @@ async function renderSetupTab(el) {
       checkFolderField(form.folder, $('#folder-msg'));
     })
   );
+  $('#move-into-app')?.addEventListener('click', async (e) => {
+    const button = e.currentTarget;
+    const ok = await confirmModal(
+      'Move the project folder into the app folder?',
+      `<b>${esc(p.folder)}</b> moves into the app's "projects" folder. Its contents stay exactly the same.<br/><br/>Close any window or program that has this folder open first. The next run starts a fresh ${esc(p.agent_label)} session, because the old one remembers the old location; the project memory carries everything over.`,
+      'Move folder',
+      false
+    );
+    if (!ok) return;
+    button.disabled = true;
+    const moved = await attempt(() => api('POST', `/api/projects/${p.id}/move-into-app`), 'The folder was moved into the app folder.');
+    button.disabled = false;
+    if (moved) {
+      state.editing = false;
+      await refreshProjectHeader();
+      await renderSetupTab(el);
+    }
+  });
   form.addEventListener('submit', async (e) => {
     e.preventDefault();
     const body = {
       name: form.name.value.trim(),
       folder: form.folder.value.trim(),
       task_prompt: form.task_prompt.value,
-      model: form.model.value,
+      model: form.model?.value ?? '',
       restore_mode: $('[name=restore_mode]:checked', form)?.value || 'zip',
       turn_limit: form.turn_limit.value,
-      budget_usd: form.budget_usd.value,
       max_minutes: form.max_minutes.value,
       fresh_every: form.fresh_every.value || 10,
     };
+    if (form.budget_usd) body.budget_usd = form.budget_usd.value;
+    if (form.effort) body.effort = form.effort.value;
     if (await attempt(() => api('PUT', `/api/projects/${p.id}`, body), 'Saved')) {
       state.editing = false;
       await refreshProjectHeader();
@@ -661,7 +804,7 @@ function renderScheduleTab(el) {
   const p = state.project;
   el.innerHTML = `
     <div class="panel">
-      <div class="spread"><h2 style="margin-top:0">When should Claude work on this project?</h2>
+      <div class="spread"><h2 style="margin-top:0">When should ${esc(p.agent_label)} work on this project?</h2>
         <label class="inline-choice"><input type="checkbox" id="sched-enabled" ${p.enabled ? 'checked' : ''}/> Schedule is on</label></div>
       <div id="schedule-box">${scheduleEditorHtml(p.schedule, p.timezone)}</div>
       <div class="row" style="margin-top:18px"><button class="primary" id="save-schedule">Save schedule</button></div>
@@ -694,13 +837,13 @@ async function renderRunsTab(el) {
   }
   el.innerHTML = `
     <table>
-      <thead><tr><th>#</th><th>Started</th><th>Trigger</th><th>Status</th><th>Duration</th><th>Turns</th><th>Cost</th><th>Files changed</th></tr></thead>
+      <thead><tr><th>#</th><th>Started</th><th>Trigger</th><th>Status</th><th>Duration</th><th>Steps</th><th>Cost</th><th>Files changed</th></tr></thead>
       <tbody>${runs
         .map(
           (r) => `<tr class="clickable" data-run="${r.id}">
             <td>${r.id}</td><td>${esc(fmtTime(r.started_at))}</td><td>${r.trigger === 'schedule' ? 'Schedule' : 'Manual'}</td>
             <td>${statusChip(r.status)}${r.status === 'skipped' && r.error ? `<div class="muted small">${esc(r.error.replace(/^skipped: /, ''))}</div>` : ''}</td>
-            <td>${fmtDuration(r.duration_ms)}</td><td>${r.turns ?? '—'}</td><td>${fmtCost(r.cost_usd)}</td><td>${r.changed_count ?? '—'}</td></tr>`
+            <td>${fmtDuration(r.duration_ms)}</td><td>${r.turns ?? '—'}</td><td>${r.status === 'skipped' ? '—' : runCost(r.agent ?? p.agent, r.cost_usd)}</td><td>${r.changed_count ?? '—'}</td></tr>`
         )
         .join('')}</tbody>
     </table>`;
@@ -779,8 +922,9 @@ async function renderRunDetail(el, runId) {
       <dl class="kv" style="margin-top:14px">
         <dt>Started</dt><dd>${esc(fmtTime(run.started_at))} (${run.trigger === 'schedule' ? 'schedule' : 'manual'})</dd>
         <dt>Duration</dt><dd>${fmtDuration(run.duration_ms)}</dd>
-        <dt>Turns</dt><dd>${run.turns ?? '—'}</dd>
-        <dt>Cost</dt><dd>${fmtCost(run.cost_usd)}</dd>
+        <dt>Steps</dt><dd>${run.turns ?? '—'}</dd>
+        <dt>Agent</dt><dd>${agentBadge(run.agent ?? p.agent)} ${run.model ? esc(kimiModelName(agentsCache?.kimi, run.model)) : ''}${run.effort ? ` · thinking ${esc(run.effort)}` : ''}</dd>
+        <dt>Cost</dt><dd>${(run.agent ?? p.agent) === 'kimi' ? 'Included in your Kimi subscription' : fmtCost(run.cost_usd)}</dd>
         <dt>Session</dt><dd>${run.session_mode ? esc(run.session_mode) : '—'} <span class="muted small mono">${esc(run.session_id ?? '')}</span></dd>
         <dt>Restore point</dt><dd>${run.restore_ref ? (run.restore_ref.type === 'git' ? `git commit <span class="mono">${esc(run.restore_ref.commit?.slice(0, 10))}</span>` : run.restore_ref.type === 'zip' ? (run.restore_available ? 'zip backup' : 'zip backup (already removed – only the last 5 are kept)') : esc(run.restore_ref.warning ?? 'none')) : '—'}</dd>
         ${run.error ? `<dt>Problem</dt><dd class="field-msg bad">${esc(run.error)}</dd>` : ''}
@@ -906,7 +1050,7 @@ function renderBrief(box) {
   box.innerHTML = `
     <div class="spread"><h2 style="margin-top:0">Brief</h2>
       <div class="row"><button id="brief-edit">Edit</button><button id="brief-history">History</button></div></div>
-    <p class="muted small">The project goal, scope, standing rules and conventions. Claude reads this at the start of every session.</p>
+    <p class="muted small">The project goal, scope, standing rules and conventions. The agent reads this at the start of every session.</p>
     <div class="panel markdown">${md(entry?.content)}</div>`;
   $('#brief-edit').addEventListener('click', () => entryEditor(box, '/memories/brief.md', 'Edit brief'));
   $('#brief-history').addEventListener('click', () => showHistory('/memories/brief.md'));
@@ -919,7 +1063,7 @@ function renderPlan(box) {
     box.innerHTML = `
       <div class="spread"><h2 style="margin-top:0">Plan</h2>
         <div class="row"><button id="plan-text">Edit as text</button><button id="plan-history">History</button></div></div>
-      <p class="muted small">The roadmap. Claude works through the steps in order and updates their status. You can add, reorder, edit and tick off steps; the next session follows your changes.</p>
+      <p class="muted small">The roadmap. The agent works through the steps in order and updates their status. You can add, reorder, edit and tick off steps; the next session follows your changes.</p>
       <div class="panel">
         ${doc.steps.length ? '' : '<p class="muted">No steps yet. Add the first one below.</p>'}
         ${doc.steps
@@ -1088,7 +1232,7 @@ function renderSession(box) {
         <dt>Current session id</dt><dd class="mono">${esc(p.session_id ?? 'none yet')}</dd>
         <dt>Runs on this session</dt><dd>${p.runs_on_session}</dd>
         <dt>Fresh session every</dt><dd>${p.fresh_every} runs <span class="muted small">(change in Setup)</span></dd>
-        <dt>Next run</dt><dd>${p.fresh_pending || !p.session_id || p.runs_on_session >= p.fresh_every ? 'will start a fresh session' : 'will resume this session'}</dd>
+        <dt>Next run</dt><dd>${p.next_fresh_reason ? `will start a fresh session <span class="muted small">(${esc(p.next_fresh_reason)})</span>` : 'will resume this session'}</dd>
       </dl>
       <p class="muted small">Resuming keeps the agent's conversation context. A fresh session starts with no conversation history and relies only on memory — that is safe, because memory carries the project state.</p>
       <button id="fresh-session" ${p.fresh_pending ? 'disabled' : ''}>${p.fresh_pending ? 'Fresh session requested' : 'Start fresh session'}</button>
@@ -1186,15 +1330,15 @@ async function renderSettings() {
       </div>
       <div class="panel">
         <h2 style="margin-top:0">Defaults for runs</h2>
-        <label>Default model</label>
+        <label>Default Claude model</label>
         <select name="default_model">${modelOptions(models, s.default_model, false)}</select>
         ${state.models?.error ? `<div class="field-msg bad">Could not load the model list: ${esc(state.models.error)}</div>` : ''}
         <div class="row" style="gap:28px">
-          <div><label>Turn limit per run</label><input type="number" name="default_turn_limit" min="1" value="${esc(s.default_turn_limit)}"/></div>
-          <div><label>Budget per run (USD)</label><input type="number" name="default_budget_usd" min="0.1" step="0.1" value="${esc(s.default_budget_usd)}"/></div>
+          <div><label>Step limit per run</label><input type="number" name="default_turn_limit" min="1" value="${esc(s.default_turn_limit)}"/></div>
+          <div><label>Budget per run (USD, Claude only)</label><input type="number" name="default_budget_usd" min="0.1" step="0.1" value="${esc(s.default_budget_usd)}"/></div>
           <div><label>Time limit per run (minutes)</label><input type="number" name="default_max_minutes" min="1" value="${esc(s.default_max_minutes)}"/></div>
         </div>
-        <label>Monthly budget cap for all projects (USD) <span class="hint">when reached, every schedule pauses until next month</span></label>
+        <label>Monthly budget cap for Claude (USD) <span class="hint">when reached, Claude schedules pause until next month; Kimi uses your subscription and is not affected</span></label>
         <input type="number" name="monthly_cap_usd" min="1" step="1" value="${esc(s.monthly_cap_usd)}"/>
         <p class="muted small">Spent this month: ${fmtCost(state.monthCost)}</p>
       </div>
@@ -1209,6 +1353,23 @@ async function renderSettings() {
       </div>
       <div class="row"><button class="primary" type="submit">Save settings</button></div>
     </form>
+    <div class="panel" style="margin-top:24px">
+      <div class="spread"><h2 style="margin-top:0">Kimi Code CLI</h2><button id="kimi-check">Check again</button></div>
+      <p class="muted small">Projects that use Kimi run on your Kimi subscription, through the Kimi Code CLI installed on this computer. There is no per-use cost and no API key. Checking does not use any of your quota.</p>
+      <dl class="kv" id="kimi-info"><dt>Checking…</dt><dd></dd></dl>
+      <div class="row" id="kimi-actions" style="margin-top:12px"></div>
+    </div>
+    <div class="panel" style="margin-top:24px">
+      <h2 style="margin-top:0">Moving the app to another computer</h2>
+      <p class="muted small">Everything lives in the app folder: the app, its settings and API key, the memory and run history of every project, and the project folders in its "projects" folder.</p>
+      <ol class="steps">
+        <li>Press <b>Shut down app</b> below, so everything is saved.</li>
+        <li>Copy the whole app folder to the other computer, for example with a USB stick:<br/><span class="mono small" id="app-folder">…</span> <button class="small" id="open-app">Open app folder</button></li>
+        <li>On the other computer, double-click <b>start.bat</b> in the copied folder. A desktop icon is created there.</li>
+        <li>If you use Kimi, open Settings there and set up Kimi Code CLI (install and log in).</li>
+      </ol>
+      <div id="outside-projects"></div>
+    </div>
     <div class="panel" style="margin-top:24px">
       <h2 style="margin-top:0">Help &amp; troubleshooting</h2>
       <dl class="kv" id="diag"><dt>Checking…</dt><dd></dd></dl>
@@ -1249,14 +1410,87 @@ async function renderSettings() {
       const ok = (v) => (v ? '✓' : '✗');
       $('#diag').innerHTML = `
         <dt>App version</dt><dd>${esc(d.app_version)}</dd>
-        <dt>Agent engine</dt><dd>${ok(d.agent_engine.binaryFound)} Claude Agent SDK ${esc(d.agent_engine.version ?? 'missing')}</dd>
+        <dt>Claude engine</dt><dd>${ok(d.agent_engine.binaryFound)} Claude Agent SDK ${esc(d.agent_engine.version ?? 'missing')}</dd>
         <dt>Node.js</dt><dd>${esc(d.node_version)}</dd>
-        <dt>Git</dt><dd>${d.git_version ? `✓ ${esc(d.git_version)}` : 'not installed (Claude uses PowerShell instead)'}</dd>
+        <dt>Git</dt><dd>${d.git_version ? `✓ ${esc(d.git_version)}` : 'not installed (the agent uses PowerShell instead)'}</dd>
         <dt>Windows</dt><dd>${esc(d.platform)}</dd>
         <dt>Free disk space</dt><dd>${d.free_disk_gb == null ? '—' : `${d.free_disk_gb} GB`}${d.free_disk_gb != null && d.free_disk_gb < 2 ? ' <span class="field-msg bad">(low)</span>' : ''}</dd>
+        <dt>App folder</dt><dd class="mono">${esc(d.app_folder)}</dd>
         <dt>Data folder</dt><dd class="mono">${esc(d.data_folder)}</dd>`;
+      if ($('#app-folder')) $('#app-folder').textContent = d.app_folder;
     })
     .catch(() => ($('#diag').innerHTML = '<dt>Diagnostics</dt><dd>not available</dd>'));
+  const showKimi = async (refresh) => {
+    const box = $('#kimi-info');
+    if (!box) return;
+    box.innerHTML = '<dt>Checking…</dt><dd></dd>';
+    const info = await loadAgents(refresh);
+    const k = info?.kimi;
+    if (!k || !$('#kimi-info')) return;
+    const yes = (v) => (v ? '✓' : '✗');
+    box.innerHTML = k.installed
+      ? `<dt>Installed</dt><dd>${yes(true)} version ${esc(k.version ?? '?')} <span class="muted small mono">${esc(k.path ?? '')}</span></dd>
+         <dt>Logged in</dt><dd>${k.loggedIn ? '✓ yes' : `<span class="field-msg bad">${k.message?.startsWith('Kimi Code CLI did not respond') ? esc(k.message) : 'Not logged in yet.'}</span>`}</dd>
+         ${k.loggedIn ? `<dt>Models</dt><dd>${k.models.map((m) => esc(m.name)).join(', ') || '—'}</dd>
+         <dt>Used for new Kimi projects</dt><dd>${esc(kimiModelName(k, k.preferredModel) ?? 'Kimi default')} with Max thinking${k.hasK31 ? '' : '<div class="muted small">K3.1 Pro is not in your Kimi model list yet. Press "Log in to Kimi again" to refresh the list.</div>'}</dd>` : ''}`
+      : `<dt>Installed</dt><dd><span class="field-msg bad">Not installed on this computer.</span></dd>`;
+    const actions = $('#kimi-actions');
+    if (!actions) return;
+    actions.innerHTML = !k.installed
+      ? `<button class="primary" data-kimi-setup="install">Install Kimi Code CLI</button><span class="muted small">Opens a window that installs Kimi Code CLI with its official installer, then asks you to log in with your Kimi account.</span>`
+      : !k.loggedIn
+        ? `<button class="primary" data-kimi-setup="login">Log in to Kimi</button><span class="muted small">Opens a window where you log in with your Kimi account.</span>`
+        : k.hasK31
+          ? ''
+          : `<button data-kimi-setup="login">Log in to Kimi again</button>`;
+    $$('[data-kimi-setup]', actions).forEach((b) =>
+      b.addEventListener('click', () =>
+        attempt(() => api('POST', '/api/agents/kimi/setup', { action: b.dataset.kimiSetup })).then((r) => {
+          if (r === undefined) return;
+          modal(
+            `<h2>${b.dataset.kimiSetup === 'install' ? 'Installing Kimi Code CLI' : 'Logging in to Kimi'}</h2>
+             <p>A PowerShell window opened (look for it in the taskbar if you do not see it). Follow the steps in that window:
+             ${b.dataset.kimiSetup === 'install' ? 'it installs Kimi Code CLI and then shows a web page and a code to log in with your Kimi account.' : 'it shows a web page and a code; open the page, log in with your Kimi account and confirm the code.'}</p>
+             <p>When the window says <b>Finished</b>, close it and press <b>Check again</b>.</p>
+             <div class="row" style="justify-content:flex-end"><button class="primary" data-close>OK</button></div>`
+          );
+        })
+      )
+    );
+    renderBanner();
+  };
+  showKimi(false);
+  $('#kimi-check').addEventListener('click', () => showKimi(true));
+  $('#open-app').addEventListener('click', () => attempt(() => api('POST', '/api/open', { what: 'app' })));
+  const showOutsideProjects = async () => {
+    const box = $('#outside-projects');
+    if (!box) return;
+    const projects = await api('GET', '/api/projects').catch(() => []);
+    const outside = projects.filter((p) => !p.folder_in_app);
+    if (!$('#outside-projects')) return;
+    box.innerHTML = outside.length
+      ? `<div class="hint-box"><b>Not copied along:</b> ${outside.length === 1 ? 'this project keeps its folder' : 'these projects keep their folders'} outside the app folder.
+          Move ${outside.length === 1 ? 'it' : 'them'} into the app folder first, or copy ${outside.length === 1 ? 'that folder' : 'those folders'} separately.
+          <ul class="plain">${outside.map((p) => `<li class="row" style="justify-content:space-between"><span><a href="#/project/${p.id}/setup">${esc(p.name)}</a> <span class="muted small mono">${esc(p.folder)}</span></span>
+            ${p.folder_exists ? `<button class="small" data-move="${p.id}" ${p.active_run_id ? 'disabled title="Wait until the active run has finished"' : ''}>Move into the app folder</button>` : '<span class="muted small">folder not found</span>'}</li>`).join('')}</ul></div>`
+      : '<p class="field-msg ok">✓ All project folders are inside the app folder, so they are copied along.</p>';
+    $$('[data-move]', box).forEach((b) =>
+      b.addEventListener('click', async () => {
+        const p = outside.find((x) => String(x.id) === b.dataset.move);
+        const ok = await confirmModal(
+          'Move the project folder into the app folder?',
+          `<b>${esc(p.folder)}</b> moves into the app's "projects" folder. Its contents stay exactly the same.<br/><br/>Close any window or program that has this folder open first. The next run of <b>${esc(p.name)}</b> starts a fresh session; the project memory carries everything over.`,
+          'Move folder',
+          false
+        );
+        if (!ok) return;
+        b.disabled = true;
+        await attempt(() => api('POST', `/api/projects/${p.id}/move-into-app`), `"${p.name}" was moved into the app folder.`);
+        showOutsideProjects();
+      })
+    );
+  };
+  showOutsideProjects();
   $('#open-logs').addEventListener('click', () => attempt(() => api('POST', '/api/open', { what: 'logs' })));
   $('#open-data').addEventListener('click', () => attempt(() => api('POST', '/api/open', { what: 'data' })));
   $('#restart')?.addEventListener('click', async () => {

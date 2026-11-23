@@ -1,11 +1,11 @@
 import { MEMORY_SERVER } from './memoryTools.js';
 
-const clip = (text, max = 1200) => {
+export const clip = (text, max = 1200) => {
   const s = String(text ?? '');
   return s.length > max ? `${s.slice(0, max)}… [${s.length - max} more characters]` : s;
 };
 
-function describeToolUse(name, input = {}) {
+export function describeToolUse(name, input = {}) {
   if (name === `mcp__${MEMORY_SERVER}__memory`) {
     const target = input.command === 'rename' ? `${input.old_path} → ${input.new_path}` : input.path ?? '/memories';
     let detail = '';
@@ -94,7 +94,7 @@ export function formatMessage(msg) {
     case 'result': {
       const cost = typeof msg.total_cost_usd === 'number' ? `$${msg.total_cost_usd.toFixed(4)}` : '?';
       const label = msg.subtype === 'success' && !msg.is_error ? 'Finished' : `Ended (${msg.subtype})`;
-      out.push({ type: 'result', content: `${label} · ${msg.num_turns} turns · ${cost} · ${Math.round((msg.duration_ms ?? 0) / 1000)}s` });
+      out.push({ type: 'result', content: `${label} · ${msg.num_turns} steps · ${cost} · ${Math.round((msg.duration_ms ?? 0) / 1000)}s` });
       if (msg.errors?.length) out.push({ type: 'error', content: msg.errors.join('\n') });
       break;
     }

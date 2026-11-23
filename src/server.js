@@ -3,23 +3,26 @@ import os from 'node:os';
 import path from 'node:path';
 import http from 'node:http';
 import express from 'express';
-import { APP_ROOT, DATA_DIR, LOG_DIR, RUNTIME_INFO, appVersion } from './paths.js';
+import { APP_ROOT, DATA_DIR, LOG_DIR, RUNTIME_INFO, PROJECTS_DIR, appVersion, samePath, isInside } from './paths.js';
 import { db, backupDatabaseIfDue } from './db.js';
 import { bus, emit } from './events.js';
 import { getSetting, setSetting, publicSettings, DEFAULTS } from './settings.js';
 import { importKeyFile } from './keyfile.js';
-import { listProjects, getProject, createProject, updateProject, deleteProject, setProjectFields, monthCost, budgetPaused, effectiveLimits } from './projects.js';
+import { listProjects, getProject, createProject, updateProject, deleteProject, setProjectFields, monthCost, budgetPaused, effectiveLimits, AGENTS, KIMI_EFFORTS } from './projects.js';
+import { kimiStatus } from './agents/kimiInfo.js';
+import { mountMemoryMcp, setServerPort } from './mcpHttp.js';
 import {
   listEntries, getEntry, memoryStore, searchMemory, entryHistory, historyVersion, ensureStandardEntries,
   exportMemory, importMemory, normalizePath, MemoryError,
 } from './memory.js';
-import { startRun, stopRun, stopAllRuns, activeRunId, recoverInterruptedRuns } from './runner.js';
+import { startRun, stopRun, stopAllRuns, activeRunId, recoverInterruptedRuns, freshSessionReason } from './runner.js';
 import { startScheduler, refreshSchedule, removeSchedule, previewSchedule, nextRunFor, describeSchedule, scheduleToCron } from './scheduler.js';
 import { isGitRepo, restoreFolder, restorePointAvailable } from './restorePoints.js';
 import { testKey, listModels, pickDefaultModel } from './anthropicApi.js';
-import { setStartWithWindows } from './autostart.js';
+import { setStartWithWindows, syncStartWithWindows, startWithWindowsHere } from './autostart.js';
 import { BRIEF_TEMPLATE, DEFAULT_TASK_PROMPT, buildBrief } from './templates.js';
-import { pickFolder, suggestProjectFolder, openPath, diagnostics, documentsDir } from './system.js';
+import { pickFolder, suggestProjectFolder, openPath, diagnostics, documentsDir, uniqueFolder, moveFolder, openPowerShellWindow } from './system.js';
+import { kimiCommand, invalidateKimiStatus, kimiSetupScript } from './agents/kimiInfo.js';
 
 const EXIT_ALREADY_RUNNING = 3;
 const EXIT_RESTART = 75;
@@ -96,12 +99,16 @@ function projectSummary(p) {
   }
   return {
     ...p,
+    agent_label: AGENTS[p.agent].label,
+    agent_long: AGENTS[p.agent].long,
+    billing: AGENTS[p.agent].billing,
     schedule_text: describeSchedule(p.schedule),
     next_run: nextRunFor(p),
-    last_run: last ? { id: last.id, status: last.status, started_at: last.started_at, cost_usd: last.cost_usd } : null,
+    last_run: last ? { id: last.id, status: last.status, started_at: last.started_at, cost_usd: last.cost_usd, model: last.model } : null,
     month_cost: monthCost(p.id),
     active_run_id: activeRunId(p.id),
     limits: effectiveLimits(p),
+    next_fresh_reason: freshSessionReason(p),
     folder_exists: folderExists,
     has_index_html: hasIndex,
   };
@@ -111,7 +118,9 @@ function projectSummary(p) {
 async function checkFolderSafety(folder) {
   const resolved = path.resolve(folder);
   const lower = resolved.toLowerCase().replace(/[\\/]+$/, '');
-  if (lower.startsWith(APP_ROOT.toLowerCase())) return 'The project folder cannot be inside the app folder.';
+  if ((samePath(resolved, APP_ROOT) || isInside(resolved, APP_ROOT)) && !isInside(resolved, PROJECTS_DIR)) {
+    return `Inside the app folder, each project needs its own folder within the "projects" folder, for example ${path.join(PROJECTS_DIR, 'My website')}`;
+  }
   if (path.parse(resolved).root.toLowerCase().replace(/[\\/]+$/, '') === lower) return 'Please do not use a whole drive. Choose or create a separate folder for this project.';
   const home = os.homedir();
   const forbidden = [
@@ -137,12 +146,15 @@ async function checkFolderSafety(folder) {
 async function validateFolder(folder, { create = false } = {}) {
   folder = String(folder ?? '').trim().replace(/^"(.*)"$/, '$1');
   if (!folder) return { ok: false, message: 'Choose a folder.' };
-  if (!path.isAbsolute(folder)) return { ok: false, message: 'Use a full path, for example C:\\Users\\you\\Documents\\Claude Projects\\My app — or press "Browse…".' };
+  if (!path.isAbsolute(folder)) return { ok: false, message: `Use a full path, for example ${path.join(PROJECTS_DIR, 'My app')}, or press "Browse…".` };
   const resolved = path.resolve(folder);
   const unsafe = await checkFolderSafety(resolved);
   if (unsafe) return { ok: false, message: unsafe };
+  const portability = isInside(resolved, PROJECTS_DIR)
+    ? ' It is inside the app folder, so it moves along when you copy the app to another computer.'
+    : ' Note: it is outside the app folder, so copying the app folder to another computer does not take it along.';
   if (!fs.existsSync(resolved)) {
-    if (!create) return { ok: true, folder: resolved, missing: true, empty: true, is_git: false, message: 'This folder does not exist yet. It will be created for you.' };
+    if (!create) return { ok: true, folder: resolved, missing: true, empty: true, is_git: false, message: `This folder does not exist yet. It will be created for you.${portability}` };
     try {
       fs.mkdirSync(resolved, { recursive: true });
     } catch (err) {
@@ -156,7 +168,7 @@ async function validateFolder(folder, { create = false } = {}) {
     folder: resolved,
     empty: items.length === 0,
     is_git: await isGitRepo(resolved),
-    message: items.length ? `Folder found (${items.length} items inside). Claude will work with what is already there.` : 'Empty folder found.',
+    message: (items.length ? `Folder found (${items.length} items inside). The agent will work with what is already there.` : 'Empty folder found.') + portability,
   };
 }
 
@@ -164,15 +176,24 @@ async function validateFolder(folder, { create = false } = {}) {
 
 app.get('/api/ping', (req, res) => res.json({ app: 'claude-agent-runner', version: appVersion(), pid: process.pid, root: APP_ROOT }));
 
-app.get('/api/state', wrap(() => ({
-  settings: publicSettings(),
-  budget_paused: budgetPaused(),
-  month_cost: monthCost(),
-  version: appVersion(),
-  can_restart: process.env.RUNNER_LAUNCHER === '1',
-})));
+/** Settings for the browser. "Start with Windows" shows whether the Startup entry starts THIS copy of the app. */
+const uiSettings = () => ({ ...publicSettings(), start_with_windows: getSetting('start_with_windows') && startWithWindowsHere() });
 
-app.get('/api/settings', wrap(() => publicSettings()));
+app.get('/api/state', wrap(() => {
+  const projects = listProjects();
+  return {
+    settings: uiSettings(),
+    budget_paused: budgetPaused(),
+    month_cost: monthCost(),
+    version: appVersion(),
+    can_restart: process.env.RUNNER_LAUNCHER === '1',
+    project_count: projects.length,
+    claude_projects: projects.filter((p) => p.agent === 'claude').length,
+    kimi_projects: projects.filter((p) => p.agent === 'kimi').length,
+  };
+}));
+
+app.get('/api/settings', wrap(() => uiSettings()));
 
 app.put('/api/settings', wrap(async (req) => {
   const body = req.body ?? {};
@@ -186,16 +207,20 @@ app.put('/api/settings', wrap(async (req) => {
       continue;
     }
     if (key === 'start_with_windows') {
-      const r = setStartWithWindows(Boolean(value));
-      if (!r.ok) throw httpError(400, r.message);
-      setSetting(key, Boolean(value));
+      // The settings form always sends this box; only touch the Startup folder when it was actually changed.
+      const wanted = Boolean(value);
+      if (wanted !== Boolean(uiSettings().start_with_windows)) {
+        const r = setStartWithWindows(wanted);
+        if (!r.ok) throw httpError(400, r.message);
+      }
+      setSetting(key, wanted);
       continue;
     }
     if (key in DEFAULTS && !['heartbeat', 'budget_paused_month', 'key_file_hash', 'api_key_source'].includes(key)) setSetting(key, value);
   }
   if (budgetPaused() && monthCost() < getSetting('monthly_cap_usd')) setSetting('budget_paused_month', '');
   emit('projects-changed', {});
-  return publicSettings();
+  return uiSettings();
 }));
 
 app.post('/api/settings/test-key', wrap(async (req) => testKey(String(req.body?.api_key || '').trim() || getSetting('api_key'))));
@@ -207,6 +232,28 @@ app.post('/api/budget/resume', wrap(() => {
 }));
 
 app.get('/api/models', wrap(() => listModels()));
+
+/**
+ * Opens a visible PowerShell window to install Kimi Code CLI (official installer) or to log in to it.
+ * Used after copying the app to a new computer, where Kimi is not set up yet.
+ */
+app.post('/api/agents/kimi/setup', wrap((req) => {
+  const action = req.body?.action;
+  if (action !== 'install' && action !== 'login') throw httpError(400, 'Unknown action');
+  const cmd = process.env.RUNNER_KIMI_COMMAND ? null : kimiCommand();
+  openPowerShellWindow(action === 'install' ? 'Install Kimi Code CLI' : 'Log in to Kimi Code CLI', kimiSetupScript(action, cmd?.command));
+  invalidateKimiStatus();
+}));
+
+/** Readiness of both agents, for the "Add project" page and Settings. Checking Kimi uses no subscription quota. */
+app.get('/api/agents', wrap(async (req) => {
+  const refresh = req.query.refresh === '1';
+  const [claudeModels, kimi] = await Promise.all([listModels(), kimiStatus({ refresh })]);
+  return {
+    claude: { ready: Boolean(getSetting('api_key')), models: claudeModels.models, default_model: getSetting('default_model') },
+    kimi,
+  };
+}));
 
 app.get('/api/templates', wrap(() => ({ brief: BRIEF_TEMPLATE, task_prompt: DEFAULT_TASK_PROMPT })));
 
@@ -267,9 +314,20 @@ function checkSchedule(body) {
   }
 }
 
+function checkAgentOptions(agent, body) {
+  if (agent === 'kimi') {
+    if (body.effort != null && body.effort !== '' && !KIMI_EFFORTS.includes(body.effort)) throw httpError(400, 'Thinking effort must be low, high or max.');
+    if (body.budget_usd) delete body.budget_usd;
+  } else if (body.effort) {
+    delete body.effort;
+  }
+}
+
 app.post('/api/projects', wrap(async (req) => {
   const body = req.body ?? {};
   if (!String(body.name ?? '').trim()) throw httpError(400, 'Give the project a name.');
+  if (!AGENTS[body.agent]) throw httpError(400, 'Choose which agent should work on this project (Claude or Kimi).');
+  checkAgentOptions(body.agent, body);
   const folder = await validateFolder(body.folder, { create: true });
   if (!folder.ok) throw httpError(400, folder.message);
   checkSchedule(body);
@@ -294,8 +352,13 @@ app.get('/api/projects/:id', wrap(async (req) => {
 app.put('/api/projects/:id', wrap(async (req) => {
   const current = requireProject(req.params.id);
   const body = { ...req.body };
+  if ('agent' in body && body.agent !== current.agent) {
+    throw httpError(400, 'The agent of a project cannot be changed. Create a new project to use another agent.');
+  }
+  delete body.agent;
+  checkAgentOptions(current.agent, body);
   checkSchedule({ timezone: current.timezone, ...body });
-  if (body.folder && path.resolve(String(body.folder)) !== current.folder) {
+  if (body.folder && !samePath(String(body.folder).trim().replace(/^"(.*)"$/, '$1'), current.folder)) {
     if (activeRunId(current.id)) throw httpError(409, 'Stop the active run before changing the folder.');
     const folder = await validateFolder(body.folder, { create: true });
     if (!folder.ok) throw httpError(400, folder.message);
@@ -318,9 +381,17 @@ app.delete('/api/projects/:id', wrap((req) => {
   emit('projects-changed', {});
 }));
 
-app.post('/api/projects/:id/run', wrap((req) => {
+app.post('/api/projects/:id/run', wrap(async (req) => {
   const p = requireProject(req.params.id);
-  if (!getSetting('api_key')) throw httpError(400, 'No Claude API key is set yet. Open Settings and enter your API key first.');
+  if (p.agent === 'claude' && !getSetting('api_key')) throw httpError(400, 'No Claude API key is set yet. Open Settings and enter your API key first.');
+  if (p.agent === 'kimi') {
+    const kimi = await kimiStatus();
+    if (!kimi.installed) throw httpError(400, 'Kimi Code CLI is not installed on this computer. Open Settings and press "Install Kimi Code CLI".');
+    if (!kimi.loggedIn) {
+      const fresh = await kimiStatus({ refresh: true });
+      if (!fresh.loggedIn) throw httpError(400, fresh.message);
+    }
+  }
   return startRun(p.id, 'manual');
 }));
 
@@ -342,6 +413,25 @@ app.post('/api/projects/:id/fresh-session', wrap((req) => {
   setProjectFields(p.id, { fresh_pending: 1 });
   emit('projects-changed', {});
   return projectSummary(getProject(p.id));
+}));
+
+/** Moves a project folder that lives elsewhere into the app's "projects" folder, so it travels with the app. */
+app.post('/api/projects/:id/move-into-app', wrap((req) => {
+  const p = requireProject(req.params.id);
+  if (activeRunId(p.id)) throw httpError(409, 'Stop the active run before moving the folder.');
+  if (isInside(p.folder, PROJECTS_DIR)) throw httpError(400, 'This project folder is already inside the app folder.');
+  if (!fs.existsSync(p.folder)) throw httpError(400, 'The project folder cannot be found on this computer. Choose its new location in Setup first.');
+  const target = uniqueFolder(PROJECTS_DIR, path.basename(p.folder));
+  if (fs.existsSync(target)) fs.rmdirSync(target);
+  try {
+    moveFolder(p.folder, target);
+  } catch (err) {
+    throw httpError(400, err.message);
+  }
+  const updated = updateProject(p.id, { folder: target });
+  console.log(`Project "${p.name}" folder moved into the app folder: ${target}`);
+  emit('projects-changed', {});
+  return projectSummary(updated);
 }));
 
 app.post('/api/projects/:id/open', wrap((req) => {
@@ -461,6 +551,10 @@ app.get('/api/events', (req, res) => {
   });
 });
 
+// ---------- Memory tools for agents that run as separate programs (Kimi) ----------
+
+mountMemoryMcp(app);
+
 // ---------- Static UI ----------
 
 app.get('/vendor/marked.js', (req, res) => res.sendFile(path.join(APP_ROOT, 'node_modules', 'marked', 'lib', 'marked.umd.js')));
@@ -488,27 +582,28 @@ function pingPort(port) {
 }
 
 /**
- * True when this same installation already answers on the port. Each installation keeps its own
- * data/runtime.json, so the process listed there is "us"; other copies of the app are not.
+ * True when this same installation (this app folder) already answers on the port. A copy of the app in
+ * another folder is a different installation, even when its data/runtime.json was copied along.
  */
 async function pingOurs(port) {
   const info = await pingPort(port);
   if (info?.app !== 'claude-agent-runner') return false;
+  if (info.root) return samePath(info.root, APP_ROOT);
   try {
-    const recorded = JSON.parse(fs.readFileSync(RUNTIME_INFO, 'utf8'));
-    if (recorded.pid === info.pid) return true;
+    return JSON.parse(fs.readFileSync(RUNTIME_INFO, 'utf8')).pid === info.pid;
   } catch {
-    /* no record */
+    return false;
   }
-  return String(info.root).toLowerCase() === APP_ROOT.toLowerCase();
 }
 
 /** Another server of this installation that is still running (found through data/runtime.json). */
 async function existingInstance() {
   try {
     const recorded = JSON.parse(fs.readFileSync(RUNTIME_INFO, 'utf8'));
+    if (recorded.root && !samePath(recorded.root, APP_ROOT)) return null; // copied from another place: stale
     const info = await pingPort(recorded.port);
-    return info?.app === 'claude-agent-runner' && info.pid === recorded.pid ? recorded : null;
+    const ours = info?.app === 'claude-agent-runner' && info.pid === recorded.pid && (!info.root || samePath(info.root, APP_ROOT));
+    return ours ? recorded : null;
   } catch {
     return null;
   }
@@ -545,6 +640,13 @@ async function shutdown(code = 0) {
   } catch {
     /* ignore */
   }
+  try {
+    // Fold the write-ahead log into app.db and close it, so the data folder is complete and safe to copy.
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+    db.close();
+  } catch (err) {
+    console.error('Could not close the database cleanly:', err.message);
+  }
   process.exit(code);
 }
 for (const sig of ['SIGINT', 'SIGTERM', 'SIGBREAK', 'SIGHUP']) process.on(sig, () => shutdown(0));
@@ -575,8 +677,23 @@ if (result.alreadyRunning) {
 }
 
 const url = `http://127.0.0.1:${result.port}`;
-fs.writeFileSync(RUNTIME_INFO, JSON.stringify({ port: result.port, url, pid: process.pid, startedAt: new Date().toISOString(), version: appVersion() }, null, 2));
+setServerPort(result.port);
+fs.writeFileSync(RUNTIME_INFO, JSON.stringify({ port: result.port, url, pid: process.pid, root: APP_ROOT, startedAt: new Date().toISOString(), version: appVersion() }, null, 2));
 console.log(`Claude Agent Runner ${appVersion()} is running at ${url}`);
+
+// After the app folder was copied to another computer or moved, point "Start with Windows" at this folder.
+if (getSetting('start_with_windows')) {
+  try {
+    const sync = syncStartWithWindows();
+    if (sync.changed) console.log('"Start with Windows" now starts the app from this folder.');
+    else if (sync.other) console.log(`"Start with Windows" starts another copy of the app (${sync.other}); it was left unchanged.`);
+  } catch (err) {
+    console.error('Could not update "Start with Windows":', err.message);
+  }
+}
+for (const p of listProjects()) {
+  if (!fs.existsSync(p.folder)) console.log(`Project "${p.name}": its folder was not found on this computer (${p.folder}). Choose its location in the project's Setup tab.`);
+}
 
 try {
   const keyResult = importKeyFile();

@@ -6,7 +6,43 @@ import { APP_ROOT, DATA_DIR, BACKUP_DIR, DB_BACKUP_DIR } from './paths.js';
 export { APP_ROOT, DATA_DIR, BACKUP_DIR, DB_BACKUP_DIR };
 
 export const DB_PATH = path.join(DATA_DIR, 'app.db');
-export const db = new DatabaseSync(DB_PATH);
+
+const isCorruption = (err) => [11, 26].includes(err?.errcode) || /malformed|not a database|corrupt/i.test(String(err?.message));
+
+/**
+ * Opens app.db. If it is damaged (for example because the app folder was copied while the app was writing),
+ * the damaged files are kept aside and the newest daily backup is used instead, so the app still starts.
+ */
+function openDatabase() {
+  let handle = null;
+  try {
+    handle = new DatabaseSync(DB_PATH);
+    handle.exec('PRAGMA busy_timeout = 5000');
+    const result = Object.values(handle.prepare('PRAGMA quick_check').get())[0];
+    if (result !== 'ok') throw Object.assign(new Error(`the database check failed: ${result}`), { errcode: 11 });
+    return { handle, recovered: null };
+  } catch (err) {
+    try {
+      handle?.close();
+    } catch {
+      /* ignore */
+    }
+    if (!isCorruption(err)) throw err;
+    const damaged = `${DB_PATH}.damaged-${new Date().toISOString().replace(/[:.]/g, '-')}`;
+    for (const suffix of ['', '-wal', '-shm']) {
+      if (fs.existsSync(DB_PATH + suffix)) fs.renameSync(DB_PATH + suffix, damaged + suffix);
+    }
+    const backups = fs.readdirSync(DB_BACKUP_DIR).filter((f) => /^app-\d{4}-\d{2}-\d{2}\.db$/.test(f)).sort();
+    const from = backups.at(-1) ?? null;
+    if (from) fs.copyFileSync(path.join(DB_BACKUP_DIR, from), DB_PATH);
+    console.error(`The database was damaged (${err.message}). It was kept as ${path.basename(damaged)}; ${from ? `the backup ${from} is used instead` : 'there was no backup, so a new database was started'}.`);
+    const recovered = { at: new Date().toISOString(), from, reason: err.message, damaged: path.basename(damaged) };
+    return { handle: new DatabaseSync(DB_PATH), recovered };
+  }
+}
+
+const opened = openDatabase();
+export const db = opened.handle;
 
 db.exec(`
 PRAGMA journal_mode = WAL;
@@ -108,13 +144,45 @@ CREATE TRIGGER IF NOT EXISTS memory_au AFTER UPDATE ON memory_entries BEGIN
 END;
 `);
 
-/** Adds columns introduced after the first release, so older databases keep working. */
+/** Adds columns introduced after the first release, so older databases keep working. Returns true when added. */
 function addColumnIfMissing(table, column, definition) {
   const columns = db.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
-  if (!columns.includes(column)) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  if (columns.includes(column)) return false;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  return true;
 }
 addColumnIfMissing('projects', 'session_cost_total', 'REAL NOT NULL DEFAULT 0');
 addColumnIfMissing('runs', 'agent_note', 'TEXT');
+// Which agent works on a project ('claude' or 'kimi'); chosen when the project is created and never changed.
+addColumnIfMissing('projects', 'agent', "TEXT NOT NULL DEFAULT 'claude'");
+// Thinking effort for agents that support it (Kimi: low / high / max).
+addColumnIfMissing('projects', 'effort', 'TEXT');
+addColumnIfMissing('runs', 'agent', 'TEXT');
+addColumnIfMissing('runs', 'model', 'TEXT');
+addColumnIfMissing('runs', 'effort', 'TEXT');
+// The full folder path the current agent session worked in. When the project folder moves (or the app folder
+// is copied to another place or computer), the next run starts a fresh session instead of continuing one
+// whose context still points at the old location.
+if (addColumnIfMissing('projects', 'session_folder', 'TEXT')) {
+  db.exec("UPDATE projects SET session_folder = folder WHERE session_id IS NOT NULL AND (folder LIKE '_:%' OR folder LIKE '\\\\%')");
+}
+
+// Shown to the owner by the browser UI until they acknowledge it.
+if (opened.recovered) {
+  db.prepare("INSERT INTO settings(key, value) VALUES ('db_recovered', ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value").run(JSON.stringify(opened.recovered));
+}
+
+/**
+ * Folds the write-ahead log back into app.db, so that app.db alone holds all data. Done when idle: a copy of
+ * the app folder made while the app is running then still has a complete, consistent database.
+ */
+export function checkpoint() {
+  try {
+    db.exec('PRAGMA wal_checkpoint(TRUNCATE)');
+  } catch {
+    /* busy: the next checkpoint will do it */
+  }
+}
 
 export const now = () => new Date().toISOString();
 

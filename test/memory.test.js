@@ -19,8 +19,8 @@ after(async () => {
 const { createProject } = await import('../src/projects.js');
 const { memoryStore, ensureStandardEntries, getEntry, searchMemory, entryHistory, normalizePath, parsePlan, parseProgress } = await import('../src/memory.js');
 
-const project = createProject({ name: 'Test', folder: tmp });
-const other = createProject({ name: 'Other', folder: tmp });
+const project = createProject({ name: 'Test', folder: tmp, agent: 'claude' });
+const other = createProject({ name: 'Other', folder: tmp, agent: 'kimi' });
 const writes = [];
 const mem = memoryStore(project.id, { changedBy: 'run #1', onWrite: (p) => writes.push(p) });
 

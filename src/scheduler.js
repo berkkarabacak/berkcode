@@ -1,12 +1,26 @@
 import { Cron } from 'croner';
-import { listProjects, getProject, budgetPaused } from './projects.js';
+import { listProjects, getProject, budgetPaused, AGENTS } from './projects.js';
 import { getSetting, setSetting } from './settings.js';
-import { startRun } from './runner.js';
+import { startRun, activeRunCount } from './runner.js';
 import { emit } from './events.js';
-import { db } from './db.js';
+import { db, checkpoint } from './db.js';
 
 const jobs = new Map();
 const DAY_NAMES = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
+
+/** Regular repeat intervals offered in the UI, in minutes. Each divides an hour or a day evenly, so the rhythm never drifts. */
+export const INTERVAL_MINUTES = [15, 30, 60, 120, 180, 240, 360, 480, 720];
+
+export function describeInterval(minutes) {
+  if (minutes < 60) return `Every ${minutes} minutes`;
+  const hours = minutes / 60;
+  return hours === 1 ? 'Every hour' : `Every ${hours} hours`;
+}
+
+/** The monthly API budget pause only applies to agents billed per use. */
+function blockedByBudget(project) {
+  return AGENTS[project.agent]?.billing === 'api' && budgetPaused();
+}
 
 function parseTime(time) {
   const m = String(time ?? '').match(/^(\d{1,2}):(\d{2})$/);
@@ -17,6 +31,12 @@ function parseTime(time) {
 /** Converts the plain-language schedule definition into a cron expression. */
 export function scheduleToCron(schedule) {
   switch (schedule?.type) {
+    case 'interval': {
+      const minutes = Number(schedule.minutes);
+      if (!INTERVAL_MINUTES.includes(minutes)) throw new Error('Choose how often it should repeat');
+      if (minutes < 60) return `*/${minutes} * * * *`;
+      return minutes === 60 ? '0 * * * *' : `0 */${minutes / 60} * * *`;
+    }
     case 'hours': {
       const every = Math.round(Number(schedule.every));
       if (!(every >= 1 && every <= 24)) throw new Error('Hours must be between 1 and 24');
@@ -44,6 +64,8 @@ export function scheduleToCron(schedule) {
 export function describeSchedule(schedule) {
   try {
     switch (schedule?.type) {
+      case 'interval':
+        return describeInterval(Number(schedule.minutes));
       case 'hours':
         return Number(schedule.every) === 1 ? 'Every hour' : `Every ${schedule.every} hours`;
       case 'daily':
@@ -66,7 +88,7 @@ export function previewSchedule(schedule, timezone, count = 3) {
 }
 
 export function nextRunFor(project) {
-  if (!project.enabled || budgetPaused()) return null;
+  if (!project.enabled || blockedByBudget(project)) return null;
   try {
     return previewSchedule(project.schedule, project.timezone, 1)[0] ?? null;
   } catch {
@@ -76,7 +98,7 @@ export function nextRunFor(project) {
 
 function fire(projectId) {
   const project = getProject(projectId);
-  if (!project?.enabled || budgetPaused()) return;
+  if (!project?.enabled || blockedByBudget(project)) return;
   try {
     console.log(`Scheduled run for project "${project.name}".`);
     startRun(projectId, 'schedule');
@@ -127,7 +149,7 @@ export function startScheduler() {
   const lastAlive = getSetting('heartbeat');
   for (const project of listProjects()) {
     refreshSchedule(project.id);
-    if (!project.enabled || !getSetting('catch_up_missed') || budgetPaused()) continue;
+    if (!project.enabled || !getSetting('catch_up_missed') || blockedByBudget(project)) continue;
     const missed = missedRunAt(project.schedule, project.timezone, lastAlive);
     if (!missed) continue;
     const ranSince = db.prepare('SELECT 1 FROM runs WHERE project_id = ? AND started_at >= ? LIMIT 1').get(project.id, missed.toISOString());
@@ -135,7 +157,10 @@ export function startScheduler() {
     console.log(`Project "${project.name}": a scheduled run was missed at ${missed.toISOString()} while the app was closed. Running once now.`);
     setTimeout(() => fire(project.id), 10_000);
   }
-  const beat = () => setSetting('heartbeat', new Date().toISOString());
+  const beat = () => {
+    setSetting('heartbeat', new Date().toISOString());
+    if (!activeRunCount()) checkpoint();
+  };
   beat();
   setInterval(beat, 60_000).unref();
   emit('projects-changed', {});

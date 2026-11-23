@@ -51,7 +51,18 @@ button.primary:hover, .btn.primary:hover { background: var(--accent-dark); }
 button.big, .btn.big { padding: 10px 20px; font-size: 16px; }
 .offline { position: fixed; inset: 0; background: rgba(246,245,242,.96); z-index: 200; display: flex; align-items: center; justify-content: center; text-align: center; padding: 20px; }
 .offline .panel { max-width: 520px; }
+.agent-choices { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 12px; }
+.agent-card { display: flex !important; gap: 10px; align-items: flex-start; font-weight: 400 !important; margin: 0 !important; border: 1px solid var(--border); border-radius: var(--radius); padding: 12px 14px; background: #fff; cursor: pointer; }
+.agent-card input { margin-top: 4px; }
+.agent-card.selected { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(201, 100, 66, .15); }
+.agent-badge { display: inline-block; font-size: 12px; font-weight: 600; padding: 2px 8px; border-radius: 99px; vertical-align: middle; }
+.agent-badge.claude { background: #f6e3da; color: var(--accent-dark); }
+.agent-badge.kimi { background: #e3e9fb; color: #2b4c9b; }
 .hint-box { background: #fbf7ef; border: 1px solid #efe3c8; border-radius: 8px; padding: 10px 14px; font-size: 14px; }
+ol.steps { margin: 10px 0 14px; padding-left: 22px; }
+ol.steps li { margin: 6px 0; }
+ul.plain { list-style: none; margin: 8px 0 0; padding: 0; }
+ul.plain li { padding: 6px 0; border-top: 1px solid #efe3c8; gap: 10px; }
 details.advanced summary { cursor: pointer; color: var(--muted); margin-top: 16px; }
 button.danger { color: var(--red); border-color: #e7aaa4; }
 button.small, .btn.small { padding: 4px 10px; font-size: 13px; }

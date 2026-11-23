@@ -1,24 +1,20 @@
+// The run lifecycle shared by all agents: lock, checks, restore point, prompt, limits, progress check,
+// change tracking and bookkeeping. The conversation itself is done by an agent adapter (src/agents/*).
 import fs from 'node:fs';
-import { query } from '@anthropic-ai/claude-agent-sdk';
-import { db, now } from './db.js';
-import { AGENT_HOME, appVersion } from './paths.js';
+import { db, now, checkpoint } from './db.js';
 import { emit } from './events.js';
+import { samePath } from './paths.js';
 import { getSetting, setSetting } from './settings.js';
 import { redact } from './redact.js';
-import { getProject, setProjectFields, effectiveLimits, monthCost, budgetPaused, currentMonthKey } from './projects.js';
+import { getProject, setProjectFields, effectiveLimits, monthCost, budgetPaused, currentMonthKey, AGENTS } from './projects.js';
 import { ensureStandardEntries, getEntry, memoryStore, parsePlan } from './memory.js';
-import { createMemoryServer, MEMORY_SERVER, MEMORY_TOOL, SEARCH_TOOL } from './memoryTools.js';
 import { buildPrompt, progressFollowUp, sessionStamp, SYSTEM_APPEND } from './prompt.js';
 import { createRestorePoint, fingerprintFolder, diffFingerprints } from './restorePoints.js';
-import { formatMessage } from './logFormat.js';
+import { runClaudeConversation } from './agents/claude.js';
+import { runKimiConversation, KIMI_RULES } from './agents/kimi.js';
 
-/** Built-in tools that make no sense in an unattended, scheduled session. */
-const DISALLOWED_TOOLS = [
-  'CronCreate', 'CronDelete', 'CronList', 'ScheduleWakeup', 'PushNotification', 'RemoteTrigger',
-  'EnterWorktree', 'ExitWorktree', 'SendMessage', 'ListAgents', 'DesignSync', 'Workflow',
-];
-const FATAL_API_ERRORS = new Set(['authentication_failed', 'billing_error', 'model_not_found', 'oauth_org_not_allowed', 'account_on_hold']);
 const HARD_STOP_MS = 20_000;
+const ADAPTERS = { claude: runClaudeConversation, kimi: runKimiConversation };
 
 /** projectId -> run context */
 const active = new Map();
@@ -33,18 +29,20 @@ export function activeRunCount() {
   return active.size;
 }
 
-const insertRun = db.prepare('INSERT INTO runs(project_id, trigger, started_at, status, ended_at, error) VALUES (?, ?, ?, ?, ?, ?)');
+const insertRun = db.prepare('INSERT INTO runs(project_id, trigger, started_at, status, ended_at, error, agent) VALUES (?, ?, ?, ?, ?, ?, ?)');
 const insertLog = db.prepare('INSERT INTO run_logs(run_id, seq, ts, type, content) VALUES (?, ?, ?, ?, ?)');
 
-function recordSkipped(projectId, trigger, reason) {
+function recordSkipped(project, trigger, reason) {
   const ts = now();
-  const res = insertRun.run(projectId, trigger, ts, 'skipped', ts, reason);
+  const res = insertRun.run(project.id, trigger, ts, 'skipped', ts, reason, project.agent);
   const runId = Number(res.lastInsertRowid);
-  emit('run-updated', { projectId, runId, status: 'skipped' });
+  emit('run-updated', { projectId: project.id, runId, status: 'skipped' });
   return { runId, status: 'skipped', reason };
 }
 
-function capReached() {
+/** The monthly cap is about API spending, so it only applies to agents billed per use (Claude). */
+function capReached(project) {
+  if (AGENTS[project.agent].billing !== 'api') return false;
   const cap = getSetting('monthly_cap_usd');
   return budgetPaused() || (cap > 0 && monthCost() >= cap);
 }
@@ -55,10 +53,10 @@ export function startRun(projectId, trigger = 'manual') {
   const project = getProject(projectId);
   if (!project) throw new Error('Project not found');
 
-  if (active.has(projectId)) return recordSkipped(projectId, trigger, 'skipped: previous run still active');
-  if (capReached()) return recordSkipped(projectId, trigger, 'skipped: monthly budget cap reached');
+  if (active.has(projectId)) return recordSkipped(project, trigger, 'skipped: previous run still active');
+  if (capReached(project)) return recordSkipped(project, trigger, 'skipped: monthly budget cap reached');
 
-  const res = insertRun.run(projectId, trigger, now(), 'running', null, null);
+  const res = insertRun.run(projectId, trigger, now(), 'running', null, null, project.agent);
   const runId = Number(res.lastInsertRowid);
   const ctx = {
     runId,
@@ -69,14 +67,13 @@ export function startRun(projectId, trigger = 'manual') {
     requestStop(reason) {
       if (this.stopReason) return;
       this.stopReason = reason;
-      this.conversation?.q.interrupt().catch(() => {});
-      this.conversation?.input.close();
+      this.conversation?.interrupt();
       this.hardStopTimer = setTimeout(() => this.abort.abort(), HARD_STOP_MS);
     },
   };
   active.set(projectId, ctx);
   emit('run-updated', { projectId, runId, status: 'running' });
-  console.log(`Run #${runId} started for project "${project.name}" (${trigger}).`);
+  console.log(`Run #${runId} started for project "${project.name}" (${AGENTS[project.agent].label}, ${trigger}).`);
 
   executeRun(project, runId, ctx).catch((err) => console.error(`Run ${runId} crashed:`, err));
   return { runId, status: 'running' };
@@ -96,71 +93,26 @@ export async function stopAllRuns(timeoutMs = 30_000) {
   while (active.size && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
 }
 
-/** A tiny async queue used as the streaming prompt, so follow-up messages and interrupts are possible. */
-function promptQueue() {
-  const items = [];
-  let wake = null;
-  let closed = false;
-  return {
-    push(text) {
-      if (closed) return;
-      items.push({ type: 'user', message: { role: 'user', content: text }, parent_tool_use_id: null });
-      wake?.();
-    },
-    close() {
-      closed = true;
-      wake?.();
-    },
-    async *[Symbol.asyncIterator]() {
-      while (true) {
-        if (items.length) yield items.shift();
-        else if (closed) return;
-        else await new Promise((resolve) => (wake = resolve));
-        wake = null;
-      }
-    },
-  };
-}
-
-function agentEnv() {
-  const env = {};
-  for (const [k, v] of Object.entries(process.env)) {
-    if (/^(ANTHROPIC_|CLAUDE_CODE_USE_|CLAUDE_CODE_OAUTH|CLAUDE_CONFIG_DIR$|AWS_BEARER_TOKEN_BEDROCK$)/i.test(k)) continue;
-    env[k] = v;
+/** Why the next run should start a fresh session instead of continuing the previous one (or null). */
+export function freshSessionReason(project, limits = effectiveLimits(project)) {
+  if (!project.session_id) return 'no previous session';
+  if (project.fresh_pending) return 'a fresh session was requested';
+  // The previous session knows the old location; continuing it could make the agent work in the old folder.
+  if (project.session_folder && !samePath(project.session_folder, project.folder)) return 'the project folder has moved';
+  if (project.runs_on_session >= project.fresh_every) return `${project.runs_on_session} runs on the previous session`;
+  if (project.agent === 'kimi') {
+    const last = db
+      .prepare('SELECT model, effort FROM runs WHERE project_id = ? AND session_id = ? AND model IS NOT NULL ORDER BY id DESC LIMIT 1')
+      .get(project.id, project.session_id);
+    if (last && project.model && last.model !== project.model) return 'the model was changed';
+    if (last && limits.effort && last.effort && last.effort !== limits.effort) return 'the thinking effort was changed';
   }
-  return {
-    ...env,
-    ANTHROPIC_API_KEY: getSetting('api_key'),
-    CLAUDE_CONFIG_DIR: AGENT_HOME,
-    DISABLE_AUTOUPDATER: '1',
-    CLAUDE_CODE_MAX_RETRIES: '4',
-    CLAUDE_AGENT_SDK_CLIENT_APP: `claude-agent-runner/${appVersion()}`,
-  };
-}
-
-function explainApiError(code, model) {
-  switch (code) {
-    case 'authentication_failed':
-      return 'The Claude API key was rejected. Open Settings, paste a valid key and press "Test key".';
-    case 'billing_error':
-      return 'The Anthropic account behind the API key has a billing problem (for example no credit left). Check the Claude Console (console.anthropic.com → Billing).';
-    case 'model_not_found':
-      return `The model "${model}" is not available for this API key. Choose another model in the project's Setup tab or in Settings.`;
-    case 'rate_limit':
-      return 'The Anthropic API is limiting requests right now. The app retried several times and then gave up. The next run will try again.';
-    case 'overloaded':
-    case 'server_error':
-      return 'The Anthropic API is overloaded or having problems right now. The app retried several times and then gave up. The next run will try again.';
-    case 'account_on_hold':
-    case 'oauth_org_not_allowed':
-      return 'The Anthropic account cannot be used right now. Check the Claude Console.';
-    default:
-      return null;
-  }
+  return null;
 }
 
 async function executeRun(project, runId, ctx) {
   const projectId = project.id;
+  const agent = AGENTS[project.agent];
   const limits = effectiveLimits(project);
   const startedMs = Date.now();
   let seq = 0;
@@ -174,14 +126,14 @@ async function executeRun(project, runId, ctx) {
   let error = null;
   let summary = null;
   let turns = 0;
-  let cost = 0;
+  let cost = null;
   let lastTotalCost = null;
   let sessionId = null;
   let sessionMode = null;
+  let model = limits.model;
   let before = null;
   let progressBefore = '';
   const memoryWritten = new Set();
-  const stderrTail = [];
 
   const timer = setTimeout(() => ctx.requestStop('timeout'), limits.maxMinutes * 60_000);
   const progressContent = () => getEntry(projectId, '/memories/progress.md')?.content ?? '';
@@ -190,80 +142,8 @@ async function executeRun(project, runId, ctx) {
     return memoryWritten.has('/memories/progress.md') && after !== progressBefore && after.length > progressBefore.length;
   };
 
-  /** Runs one agent conversation. The follow-up asking for a progress entry is sent in the same session. */
-  async function converse(prompt, resumeId) {
-    const input = promptQueue();
-    input.push(prompt);
-    const out = { sessionId: null, results: [], assistantCount: 0, apiError: null, exception: null };
-    let followUpSent = false;
-    const q = query({
-      prompt: input,
-      options: {
-        cwd: project.folder,
-        model: limits.model,
-        maxTurns: limits.maxTurns,
-        maxBudgetUsd: limits.budgetUsd,
-        resume: resumeId || undefined,
-        abortController: ctx.abort,
-        permissionMode: 'bypassPermissions',
-        allowDangerouslySkipPermissions: true,
-        mcpServers: { [MEMORY_SERVER]: createMemoryServer(projectId, { changedBy: `run #${runId}`, onWrite: (p) => memoryWritten.add(p) }) },
-        allowedTools: [MEMORY_TOOL, SEARCH_TOOL],
-        disallowedTools: DISALLOWED_TOOLS,
-        strictMcpConfig: true,
-        settingSources: [],
-        settings: { autoMemoryEnabled: false },
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_APPEND },
-        env: agentEnv(),
-        stderr: (data) => {
-          stderrTail.push(redact(String(data)));
-          if (stderrTail.length > 40) stderrTail.shift();
-        },
-      },
-    });
-    ctx.conversation = { q, input };
-    if (ctx.stopReason) {
-      q.interrupt().catch(() => {});
-      input.close();
-    }
-    try {
-      for await (const msg of q) {
-        if (msg.session_id) out.sessionId = msg.session_id;
-        if (msg.type === 'assistant' && !msg.parent_tool_use_id) {
-          out.assistantCount++;
-          if (msg.error) {
-            out.apiError = msg.error;
-            if (FATAL_API_ERRORS.has(msg.error)) input.close();
-          }
-        }
-        for (const entry of formatMessage(msg)) log(entry.type, entry.content);
-        if (msg.type === 'result') {
-          out.results.push(msg);
-          const mainOk = msg.subtype === 'success' && !msg.is_error;
-          if (!ctx.stopReason && mainOk && !followUpSent && !progressWritten()) {
-            followUpSent = true;
-            log('warning', 'The agent finished without writing a progress entry. Asking it to write one now.');
-            input.push(progressFollowUp(sessionStamp(project.timezone)));
-          } else {
-            input.close();
-          }
-        }
-      }
-    } catch (err) {
-      out.exception = err;
-    } finally {
-      input.close();
-      ctx.conversation = null;
-    }
-    for (const r of out.results) turns += r.num_turns ?? 0;
-    const last = out.results.at(-1);
-    if (last && typeof last.total_cost_usd === 'number') lastTotalCost = last.total_cost_usd;
-    if (out.sessionId) sessionId = out.sessionId;
-    return out;
-  }
-
   try {
-    if (!getSetting('api_key')) throw new RunError('No Claude API key is set. Open Settings and enter your API key.');
+    if (agent.billing === 'api' && !getSetting('api_key')) throw new RunError('No Claude API key is set. Open Settings and enter your API key.');
     let stat = null;
     try {
       stat = fs.statSync(project.folder);
@@ -286,58 +166,60 @@ async function executeRun(project, runId, ctx) {
     before = fingerprintFolder(project.folder);
 
     const fresh = getProject(projectId);
-    const freshDue = !fresh.session_id || fresh.fresh_pending || fresh.runs_on_session >= fresh.fresh_every;
-    const resumeId = freshDue ? null : fresh.session_id;
-    let baseline = resumeId ? fresh.session_cost_total || 0 : 0;
+    const freshReason = freshSessionReason(fresh, limits);
+    const resumeId = freshReason ? null : fresh.session_id;
+    const baseline = resumeId ? fresh.session_cost_total || 0 : 0;
     sessionMode = resumeId ? 'resumed' : 'fresh';
-    log('system', resumeId ? `Continuing the previous session (run ${fresh.runs_on_session + 1} on this session).` : 'Starting a fresh session. The agent will rely on its memory.');
+    log('system', resumeId
+      ? `Continuing the previous ${agent.label} session (run ${fresh.runs_on_session + 1} on this session).`
+      : `Starting a fresh ${agent.label} session (${freshReason}). The agent relies on its memory.`);
 
-    const prompt = buildPrompt(fresh);
+    // Claude gets the standing rules through its system prompt; Kimi has no such channel, so they lead the prompt.
+    const prompt = project.agent === 'kimi' ? `${SYSTEM_APPEND.trim()}\n${KIMI_RULES}\n\n${buildPrompt(fresh)}` : buildPrompt(fresh);
     log('prompt', prompt);
 
-    let r = await converse(prompt, resumeId);
+    let followUpSent = false;
+    const onTurnEnd = () => {
+      if (ctx.stopReason || followUpSent || progressWritten()) return null;
+      followUpSent = true;
+      log('warning', 'The agent finished without writing a progress entry. Asking it to write one now.');
+      return progressFollowUp(sessionStamp(project.timezone));
+    };
 
-    const resumeFailed =
-      resumeId && !ctx.stopReason && r.assistantCount === 0 && !FATAL_API_ERRORS.has(r.apiError) &&
-      (r.exception || r.results.length === 0 || r.results.every((x) => x.is_error));
-    if (resumeFailed) {
-      const reason = r.exception?.message || r.results.flatMap((x) => x.errors ?? []).join('; ') || 'unknown reason';
-      log('warning', `The previous session could not be continued (${redact(reason)}). Starting a fresh session instead; memory carries the project state.`);
-      sessionMode = 'fresh (resume failed)';
-      sessionId = null;
-      baseline = 0;
-      r = await converse(prompt, null);
+    const r = await ADAPTERS[project.agent]({
+      ctx, projectId, folder: project.folder, limits, prompt, resumeId, runId, log, memoryWritten, onTurnEnd,
+    });
+    sessionId = r.sessionId;
+    turns = r.turns;
+    model = r.model ?? model;
+    if (resumeId && !r.resumed) sessionMode = 'fresh (resume failed)';
+
+    if (agent.billing === 'api') {
+      lastTotalCost = r.costTotal;
+      const base = sessionMode === 'resumed' ? baseline : 0;
+      if (lastTotalCost != null) cost = lastTotalCost >= base - 1e-9 ? lastTotalCost - base : lastTotalCost;
+      else if (turns > 0) log('warning', 'The cost of this run could not be read because it ended abruptly.');
     }
 
-    if (lastTotalCost != null) cost = lastTotalCost >= baseline - 1e-9 ? lastTotalCost - baseline : lastTotalCost;
-    else if (turns > 0) log('warning', 'The cost of this run could not be read because it ended abruptly.');
-
-    const main = r.results[0];
-    const fatal = explainApiError(r.apiError, limits.model);
+    const main = r.outcomes[0];
     if (ctx.stopReason) {
       // status set in finally
-    } else if (r.apiError && FATAL_API_ERRORS.has(r.apiError)) {
-      throw new RunError(fatal);
-    } else if (main?.subtype === 'success' && !main.is_error) {
-      summary = main.result || r.results.at(-1)?.result || null;
+    } else if (r.fatal) {
+      throw new RunError(r.error);
+    } else if (main === 'success') {
+      summary = r.summary;
       if (progressWritten()) {
         status = 'success';
       } else {
         status = 'failed';
         error = 'The session ended without writing a progress entry, even after being asked.';
       }
-    } else if (main?.subtype === 'error_max_turns' || main?.subtype === 'error_max_budget_usd') {
+    } else if (main === 'max_turns' || main === 'max_budget') {
       status = 'limit_reached';
-      error = main.subtype === 'error_max_turns' ? `Turn limit reached (${limits.maxTurns} turns).` : `Budget limit for one run reached ($${limits.budgetUsd}).`;
+      error = main === 'max_turns' ? `Step limit reached (${limits.maxTurns} steps).` : `Budget limit for one run reached ($${limits.budgetUsd}).`;
     } else {
       status = 'failed';
-      error =
-        fatal ||
-        main?.errors?.filter(Boolean).join('\n') ||
-        (main?.is_error ? main.result : null) ||
-        r.exception?.message ||
-        'The agent stopped unexpectedly.';
-      if (!main && stderrTail.length) error += `\n${stderrTail.slice(-5).join('').trim()}`;
+      error = r.error || 'The agent stopped unexpectedly.';
     }
   } catch (err) {
     status = 'failed';
@@ -384,17 +266,17 @@ async function executeRun(project, runId, ctx) {
       const steps = parsePlan(getEntry(projectId, '/memories/plan.md')?.content);
       planFinished = steps.length > 0 && steps.every((s) => s.status === 'done');
       if (planFinished && getProject(projectId)?.enabled) {
-        log('system', 'Every step of the plan is done, so the schedule was paused to save money. Add new steps to the plan and resume the schedule when you want more work done.');
+        log('system', 'Every step of the plan is done, so the schedule was paused. Add new steps to the plan and resume the schedule when you want more work done.');
       }
     }
 
     db.prepare(
       `UPDATE runs SET ended_at = ?, status = ?, session_id = ?, session_mode = ?, turns = ?, cost_usd = ?, duration_ms = ?,
-       summary = ?, changed_files = ?, memory_written = ?, error = ?, agent_note = ? WHERE id = ?`
+       summary = ?, changed_files = ?, memory_written = ?, error = ?, agent_note = ?, agent = ?, model = ?, effort = ? WHERE id = ?`
     ).run(
-      now(), status, sessionId, sessionMode, turns, Math.round(cost * 10000) / 10000, Date.now() - startedMs,
+      now(), status, sessionId, sessionMode, turns, cost == null ? null : Math.round(cost * 10000) / 10000, Date.now() - startedMs,
       summary ? redact(summary) : null, changedFiles ? JSON.stringify(changedFiles) : null,
-      JSON.stringify([...memoryWritten].sort()), error ? redact(error) : null, agentNote, runId
+      JSON.stringify([...memoryWritten].sort()), error ? redact(error) : null, agentNote, project.agent, model ?? null, limits.effort ?? null, runId
     );
 
     const latest = getProject(projectId);
@@ -402,6 +284,7 @@ async function executeRun(project, runId, ctx) {
       const fields = {};
       if (sessionId && turns > 0) {
         fields.session_id = sessionId;
+        fields.session_folder = project.folder;
         fields.runs_on_session = sessionMode?.startsWith('fresh') ? 1 : latest.runs_on_session + 1;
         fields.fresh_pending = 0;
         if (lastTotalCost != null) fields.session_cost_total = lastTotalCost;
@@ -416,17 +299,18 @@ async function executeRun(project, runId, ctx) {
         fields.consecutive_failures = 0;
         if (planFinished && latest.enabled) {
           fields.enabled = 0;
-          fields.paused_reason = 'All plan steps are done, so the schedule was paused to save money. Add new steps to the plan, then press "Resume schedule".';
+          fields.paused_reason = 'All plan steps are done, so the schedule was paused. Add new steps to the plan, then press "Resume schedule".';
         }
       }
       setProjectFields(projectId, fields);
     }
 
     active.delete(projectId);
-    console.log(`Run #${runId} finished: ${status}${error ? ` (${error.split('\n')[0]})` : ''}, ${turns} turns, $${cost.toFixed(4)}.`);
+    if (!active.size) checkpoint();
+    console.log(`Run #${runId} finished: ${status}${error ? ` (${error.split('\n')[0]})` : ''}, ${turns} steps${cost != null ? `, $${cost.toFixed(4)}` : ''}.`);
 
     const cap = getSetting('monthly_cap_usd');
-    if (cap > 0 && monthCost() >= cap && !budgetPaused()) {
+    if (agent.billing === 'api' && cap > 0 && monthCost() >= cap && !budgetPaused()) {
       setSetting('budget_paused_month', currentMonthKey());
       emit('budget-paused', { cap });
     }

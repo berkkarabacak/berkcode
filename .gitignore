@@ -1,6 +1,7 @@
 node_modules/
 data/
 runtime/
+projects/
 *.log
 claudeapi.key
 *.key

@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
 import { spawn } from 'node:child_process';
-import { APP_ROOT, LOG_DIR, RUNTIME_DIR, RUNTIME_INFO } from './paths.js';
+import { APP_ROOT, LOG_DIR, RUNTIME_DIR, RUNTIME_INFO, samePath } from './paths.js';
 
 const SERVER = path.join(APP_ROOT, 'src', 'server.js');
 const EXIT_ALREADY_RUNNING = 3;
@@ -73,12 +73,16 @@ function ping(port) {
   });
 }
 
-/** This installation's server is running if the process recorded in data/runtime.json answers on its port. */
+/**
+ * This installation's server is running if the process recorded in data/runtime.json answers on its port
+ * from this same app folder. A runtime.json copied from another place (or computer) is ignored.
+ */
 async function alreadyRunning() {
   try {
     const recorded = JSON.parse(fs.readFileSync(RUNTIME_INFO, 'utf8'));
+    if (recorded.root && !samePath(recorded.root, APP_ROOT)) return false;
     const info = await ping(recorded.port);
-    return info?.app === 'claude-agent-runner' && info.pid === recorded.pid;
+    return info?.app === 'claude-agent-runner' && info.pid === recorded.pid && (!info.root || samePath(info.root, APP_ROOT));
   } catch {
     return false;
   }

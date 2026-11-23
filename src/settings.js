@@ -15,6 +15,8 @@ export const DEFAULTS = {
   backup_size_limit_mb: 500,
   budget_paused_month: '',
   heartbeat: '',
+  // Set when a damaged database was replaced by its backup at startup (JSON); cleared when the owner presses OK.
+  db_recovered: '',
 };
 
 /** Allowed ranges for numeric settings; out-of-range or non-numeric values fall back to the default. */

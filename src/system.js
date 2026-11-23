@@ -3,7 +3,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { execFile, spawn } from 'node:child_process';
 import { promisify } from 'node:util';
-import { APP_ROOT, DATA_DIR, LOG_DIR, appVersion } from './paths.js';
+import { APP_ROOT, DATA_DIR, LOG_DIR, PROJECTS_DIR, appVersion } from './paths.js';
 
 const execFileAsync = promisify(execFile);
 const isWindows = process.platform === 'win32';
@@ -33,24 +33,64 @@ export async function documentsDir() {
   return dir;
 }
 
-/** Suggests a new, unused folder for a project, e.g. Documents\Claude Projects\My website. */
-export async function suggestProjectFolder(name) {
-  const base = path.join(await documentsDir(), 'Claude Projects');
-  const clean = String(name || 'My project').replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ').replace(/\s+/g, ' ').trim().replace(/[. ]+$/, '') || 'My project';
+const cleanName = (name) =>
+  String(name || 'My project').replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ').replace(/\s+/g, ' ').trim().replace(/[. ]+$/, '') || 'My project';
+
+/** A folder path in `base` named after `name` that does not exist yet or is empty ("My site", "My site 2", …). */
+export function uniqueFolder(base, name) {
+  const clean = cleanName(name);
   let candidate = path.join(base, clean);
   for (let i = 2; fs.existsSync(candidate) && fs.readdirSync(candidate).length > 0; i++) candidate = path.join(base, `${clean} ${i}`);
   return candidate;
 }
 
+/**
+ * Suggests a new folder for a project inside the app's "projects" folder, so the project moves along
+ * when the app folder is copied to another computer.
+ */
+export async function suggestProjectFolder(name) {
+  return uniqueFolder(PROJECTS_DIR, name);
+}
+
+/** Moves a folder (also across drives). Returns the new path. */
+export function moveFolder(from, to) {
+  fs.mkdirSync(path.dirname(to), { recursive: true });
+  try {
+    fs.renameSync(from, to);
+  } catch (err) {
+    if (err.code !== 'EXDEV') {
+      if (err.code === 'EPERM' || err.code === 'EBUSY' || err.code === 'EACCES') {
+        throw new Error('The folder is in use. Close any window or program that has it open (for example Explorer or an editor), then try again.');
+      }
+      throw err;
+    }
+    fs.cpSync(from, to, { recursive: true, errorOnExist: true, force: false, preserveTimestamps: true });
+    fs.rmSync(from, { recursive: true, force: true });
+  }
+  return to;
+}
+
+/** Opens a visible PowerShell window running `script` (used for Kimi set-up steps that need the user). */
+export function openPowerShellWindow(title, script) {
+  if (!isWindows) throw new Error('This is only available on Windows.');
+  const encoded = Buffer.from(`$Host.UI.RawUI.WindowTitle = '${title.replace(/'/g, "''")}'\n${script}`, 'utf16le').toString('base64');
+  spawn('cmd.exe', ['/c', 'start', '""', 'powershell.exe', '-NoProfile', '-NoExit', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], {
+    detached: true,
+    stdio: 'ignore',
+    windowsHide: false,
+    cwd: os.homedir(),
+  }).unref();
+}
+
 /** Shows the Windows "choose folder" dialog on this computer and returns the chosen path (or null). */
 export async function pickFolder(initial) {
   if (!isWindows) throw new Error('The folder picker is only available on Windows. Type the path instead.');
-  const start = initial && fs.existsSync(initial) ? initial : await documentsDir();
+  const start = initial && fs.existsSync(initial) ? initial : fs.existsSync(PROJECTS_DIR) ? PROJECTS_DIR : await documentsDir();
   const script = `
 Add-Type -AssemblyName System.Windows.Forms
 $owner = New-Object System.Windows.Forms.Form -Property @{ TopMost = $true }
 $dialog = New-Object System.Windows.Forms.FolderBrowserDialog
-$dialog.Description = 'Choose the folder Claude should work in (you can also make a new folder here)'
+$dialog.Description = 'Choose the folder the agent should work in (you can also make a new folder here)'
 $dialog.ShowNewFolderButton = $true
 $dialog.SelectedPath = '${start.replace(/'/g, "''")}'
 if ($dialog.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { [Console]::Out.Write($dialog.SelectedPath) }

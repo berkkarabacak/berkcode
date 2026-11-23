@@ -58,10 +58,34 @@ function Open-Browser([string]$Url) {
   Start-Process $Url
 }
 
+# True when both paths are the same app folder, also when one of them is written differently
+# (short 8.3 names such as C:\Users\ODINLO~1, links or mapped drives): a probe file made in one must appear in the other.
+function Test-SamePath([string]$A, [string]$B) {
+  if (-not $A -or -not $B) { return $false }
+  try {
+    $first = [IO.Path]::GetFullPath($A).TrimEnd('\')
+    $second = [IO.Path]::GetFullPath($B).TrimEnd('\')
+    if ($first.Equals($second, [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    $firstData = Join-Path $first 'data'
+    $secondData = Join-Path $second 'data'
+    if (-not (Test-Path -LiteralPath $firstData -PathType Container) -or -not (Test-Path -LiteralPath $secondData -PathType Container)) { return $false }
+    $probe = '.same-folder-check-' + [Guid]::NewGuid().ToString('N')
+    $probeFile = Join-Path $firstData $probe
+    New-Item -ItemType File -Path $probeFile -Force | Out-Null
+    try { return (Test-Path -LiteralPath (Join-Path $secondData $probe)) }
+    finally { Remove-Item -LiteralPath $probeFile -Force -ErrorAction SilentlyContinue }
+  } catch { return $false }
+}
+
+# The app is running from THIS folder if the server recorded in data\runtime.json answers and reports this folder.
+# (A runtime.json copied along from another folder or computer is ignored.)
 function Get-RunningAppUrl {
   if (-not (Test-Path $RuntimeInfo)) { return $null }
   try {
-    $info = Get-Content -Path $RuntimeInfo -Raw | ConvertFrom-Json
+    # The app writes UTF-8; Windows PowerShell would otherwise read it in the old ANSI code page and garble
+    # folder names with letters such as c-cedilla or dotless i.
+    $info = Get-Content -Path $RuntimeInfo -Raw -Encoding UTF8 | ConvertFrom-Json
+    if ($info.root -and -not (Test-SamePath $info.root $Root)) { return $null }
     $request = [System.Net.HttpWebRequest]::Create("http://127.0.0.1:$($info.port)/api/ping")
     $request.Proxy = $null
     $request.Timeout = 2000
@@ -70,7 +94,8 @@ function Get-RunningAppUrl {
     $body = $reader.ReadToEnd()
     $response.Close()
     $ping = $body | ConvertFrom-Json
-    if ($ping.app -eq 'claude-agent-runner' -and $ping.pid -eq $info.pid) { return "http://127.0.0.1:$($info.port)" }
+    $sameFolder = (-not $ping.root) -or (Test-SamePath $ping.root $Root)
+    if ($ping.app -eq 'claude-agent-runner' -and $ping.pid -eq $info.pid -and $sameFolder) { return "http://127.0.0.1:$($info.port)" }
   } catch {}
   return $null
 }
@@ -190,7 +215,7 @@ function Install-Git {
     Say 'Git is ready.' 'Green'
   } catch {
     Write-SetupLog "Git could not be installed: $_"
-    Say 'Git could not be installed. That is OK: the app still works (Claude uses PowerShell instead).' 'Yellow'
+    Say 'Git could not be installed. That is OK: the app still works (the agent uses PowerShell instead).' 'Yellow'
   }
 }
 
@@ -233,8 +258,11 @@ function Test-InOneDrive {
 }
 
 function New-DesktopShortcut([string]$AppFolder) {
+  # The marker remembers the computer, user and folder the icon was made for, so a copy of the app
+  # on another computer (or in another folder) gets its own icon.
   $marker = Join-Path $AppFolder 'data\shortcut-created'
-  if (Test-Path $marker) { return }
+  $identity = "$env:COMPUTERNAME|$env:USERNAME|$AppFolder"
+  if ((Test-Path $marker) -and ((Get-Content -Path $marker -Raw -Encoding UTF8).Trim() -eq $identity)) { return }
   try {
     $desktop = [Environment]::GetFolderPath('Desktop')
     $link = Join-Path $desktop 'Claude Agent Runner.lnk'
@@ -242,10 +270,11 @@ function New-DesktopShortcut([string]$AppFolder) {
     $shell = New-Object -ComObject WScript.Shell
     if (Test-Path $link) {
       $existing = $shell.CreateShortcut($link).TargetPath
-      if ($existing -and (Test-Path $existing) -and -not $existing.Equals($target, [StringComparison]::OrdinalIgnoreCase)) {
-        # The icon already opens another working copy of the app: leave it alone.
+      $ours = $existing -and $existing.Equals($target, [StringComparison]::OrdinalIgnoreCase)
+      if ($ours -or ($existing -and (Test-Path $existing))) {
+        # The icon already opens this folder, or another working copy of the app: leave it alone.
         New-Item -ItemType Directory -Force -Path (Join-Path $AppFolder 'data') | Out-Null
-        Set-Content -Path $marker -Value 'kept existing icon' -Encoding ASCII
+        Set-Content -Path $marker -Value $identity -Encoding UTF8
         return
       }
     }
@@ -257,7 +286,7 @@ function New-DesktopShortcut([string]$AppFolder) {
     $shortcut.Description = 'Start Claude Agent Runner'
     $shortcut.Save()
     New-Item -ItemType Directory -Force -Path (Join-Path $AppFolder 'data') | Out-Null
-    Set-Content -Path $marker -Value 'yes' -Encoding ASCII
+    Set-Content -Path $marker -Value $identity -Encoding UTF8
     Say 'A "Claude Agent Runner" icon was added to your desktop. Use it to open the app next time.' 'Green'
   } catch { Write-SetupLog "Could not create the desktop icon: $_" }
 }
@@ -284,25 +313,45 @@ if ((Test-InOneDrive) -and -not $Root.Equals($InstallDir, [StringComparison]::Or
   Say 'This folder is synced by OneDrive. The app will be installed in a local folder so it works reliably...' 'Cyan'
   try {
     New-Item -ItemType Directory -Force -Path $InstallDir | Out-Null
-    & robocopy.exe $Root $InstallDir /E /XD node_modules runtime data .git scratch /NFL /NDL /NJH /NJS /NP | Out-Null
+    # The app's own files are refreshed on every start. The data and the project folders are copied only the
+    # first time: from then on the local copy is the one in use, and copying them again would overwrite newer work.
+    & robocopy.exe $Root $InstallDir /E /XD node_modules runtime data projects .git scratch /NFL /NDL /NJH /NJS /NP | Out-Null
     if ($LASTEXITCODE -ge 8) { throw "copying failed (robocopy code $LASTEXITCODE)" }
     $sourceData = Join-Path $Root 'data\app.db'
     $targetData = Join-Path $InstallDir 'data'
     if ((Test-Path $sourceData) -and -not (Test-Path (Join-Path $targetData 'app.db'))) {
       & robocopy.exe (Join-Path $Root 'data') $targetData /E /XD logs tmp /XF runtime.json /NFL /NDL /NJH /NJS /NP | Out-Null
+      if ($LASTEXITCODE -ge 8) { throw "copying the data failed (robocopy code $LASTEXITCODE)" }
+      # Also take along what an app folder copied from another computer already has, so nothing is downloaded again.
+      foreach ($part in @('projects', 'runtime', 'node_modules')) {
+        $from = Join-Path $Root $part
+        $to = Join-Path $InstallDir $part
+        if ((Test-Path $from) -and -not (Test-Path $to)) {
+          & robocopy.exe $from $to /E /NFL /NDL /NJH /NJS /NP | Out-Null
+          if ($LASTEXITCODE -ge 8) { throw "copying $part failed (robocopy code $LASTEXITCODE)" }
+        }
+      }
     }
   } catch { Stop-WithError "The app could not be copied to $InstallDir. $_" }
   Say "Installed in $InstallDir" 'Green'
-  $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$(Join-Path $InstallDir 'scripts\start.ps1')`"")
-  if ($Background) { $arguments += '-Background' }
-  $child = Start-Process -FilePath 'powershell.exe' -ArgumentList $arguments -NoNewWindow -Wait -PassThru
-  exit $child.ExitCode
+  # Run the local copy's start script right here. (Start-Process -Wait would also wait for the app it starts,
+  # which keeps running, so this window would never close.)
+  $installScript = Join-Path $InstallDir 'scripts\start.ps1'
+  if ($Background) { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installScript -Background }
+  else { & powershell.exe -NoProfile -ExecutionPolicy Bypass -File $installScript }
+  exit $LASTEXITCODE
 }
 
 # Files downloaded from the internet are marked as unsafe by Windows; the app's own files are fine.
 try {
   foreach ($folder in @($Root, (Join-Path $Root 'scripts'), (Join-Path $Root 'src'), (Join-Path $Root 'public'))) {
     Get-ChildItem -Path $folder -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
+  }
+  # An app folder that arrived as a download (for example a ZIP from e-mail or cloud storage) also carries the
+  # mark on its own Node.js and components, which can make Windows ask before starting them. Remove it once.
+  if (Get-Item -LiteralPath $NodeExe -Stream Zone.Identifier -ErrorAction SilentlyContinue) {
+    Say 'Preparing the copied app files (only once)...'
+    Get-ChildItem -LiteralPath $Runtime, (Join-Path $Root 'node_modules') -Recurse -File -ErrorAction SilentlyContinue | Unblock-File -ErrorAction SilentlyContinue
   }
 } catch {}
 
@@ -334,6 +383,6 @@ while ((Get-Date) -lt $deadline) {
 $appLog = Get-ChildItem -Path $LogDir -Filter 'app-*.log' -ErrorAction SilentlyContinue | Sort-Object LastWriteTime | Select-Object -Last 1
 if ($appLog) {
   Write-SetupLog '--- last lines of the app log ---'
-  Get-Content -Path $appLog.FullName -Tail 30 | ForEach-Object { Write-SetupLog $_ }
+  Get-Content -Path $appLog.FullName -Tail 30 -Encoding UTF8 | ForEach-Object { Write-SetupLog $_ }
 }
 Stop-WithError 'The app did not start within 90 seconds.'
