@@ -125,6 +125,16 @@ export function invalidateKimiStatus() {
   cache = null;
 }
 
+/** The last known Kimi status, without checking again (null when not known yet). */
+export function peekKimiStatus() {
+  return cache?.value ?? null;
+}
+
+/** How old the last known Kimi status is, in milliseconds (Infinity when there is none). */
+export function kimiStatusAge() {
+  return cache ? Date.now() - cache.at : Infinity;
+}
+
 /** Returns { installed, path, version, loggedIn, models, preferredModel, hasK31, message }. Cached for 10 minutes. */
 export async function kimiStatus({ refresh = false } = {}) {
   if (!refresh && cache && Date.now() - cache.at < 10 * 60_000) return cache.value;

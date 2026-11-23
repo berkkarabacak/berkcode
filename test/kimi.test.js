@@ -158,6 +158,19 @@ test('when Kimi keeps working in a new turn by itself, the app waits for it inst
   assert.match(run.summary, /second turn/);
 });
 
+test('while a session runs, the icon next to the clock says what is being worked on', async () => {
+  const { trayStatus } = await import('../src/status.js');
+  const project = newProject('kimi-tray', { task: 'Take your time. [fake:slow]' });
+  const done = runAndWait(project.id, { stopAfterMs: 2500 });
+  await new Promise((r) => setTimeout(r, 1200));
+  const busy = trayStatus({ kimi: { installed: true, loggedIn: true } });
+  assert.equal(busy.state, 'working');
+  assert.match(busy.tooltip, /^Claude Agent Runner\nWorking on kimi-tray$/);
+  assert.match(busy.lines[0].text, /^Working on kimi-tray \(since \d\d:\d\d\)$/);
+  await done;
+  assert.notEqual(trayStatus({ kimi: { installed: true, loggedIn: true } }).state, 'working');
+});
+
 test('Stop ends a Kimi run cleanly', async () => {
   const project = newProject('kimi-stop', { task: 'Take your time. [fake:slow]' });
   const run = await runAndWait(project.id, { stopAfterMs: 2500 });

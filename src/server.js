@@ -20,6 +20,8 @@ import { startScheduler, refreshSchedule, removeSchedule, previewSchedule, nextR
 import { isGitRepo, restoreFolder, restorePointAvailable } from './restorePoints.js';
 import { testKey, listModels, pickDefaultModel } from './anthropicApi.js';
 import { setStartWithWindows, syncStartWithWindows, startWithWindowsHere } from './autostart.js';
+import { trayStatus } from './status.js';
+import { initTray, startTray, trayAvailable, trayCheckedIn, trayShuttingDown } from './tray.js';
 import { BRIEF_TEMPLATE, DEFAULT_TASK_PROMPT, buildBrief } from './templates.js';
 import { pickFolder, suggestProjectFolder, openPath, diagnostics, documentsDir, uniqueFolder, moveFolder, openPowerShellWindow } from './system.js';
 import { kimiCommand, invalidateKimiStatus, kimiSetupScript } from './agents/kimiInfo.js';
@@ -187,6 +189,7 @@ app.get('/api/state', wrap(() => {
     month_cost: monthCost(),
     version: appVersion(),
     can_restart: process.env.RUNNER_LAUNCHER === '1',
+    tray_available: trayAvailable(),
     project_count: projects.length,
     claude_projects: projects.filter((p) => p.agent === 'claude').length,
     kimi_projects: projects.filter((p) => p.agent === 'kimi').length,
@@ -219,6 +222,8 @@ app.put('/api/settings', wrap(async (req) => {
     if (key in DEFAULTS && !['heartbeat', 'budget_paused_month', 'key_file_hash', 'api_key_source'].includes(key)) setSetting(key, value);
   }
   if (budgetPaused() && monthCost() < getSetting('monthly_cap_usd')) setSetting('budget_paused_month', '');
+  // Switching the icon on starts it right away; switching it off makes it close itself within a few seconds.
+  if ('tray_icon' in body && getSetting('tray_icon')) startTray();
   emit('projects-changed', {});
   return uiSettings();
 }));
@@ -264,6 +269,16 @@ app.post('/api/open', wrap((req) => {
   const target = what === 'logs' ? LOG_DIR : what === 'data' ? DATA_DIR : what === 'app' ? APP_ROOT : null;
   if (!target) throw httpError(400, 'Unknown folder');
   openPath(target);
+}));
+
+/** For the icon next to the clock: state, tooltip and menu lines. "show: false" makes the icon close itself. */
+app.get('/api/tray', wrap(() => {
+  trayCheckedIn();
+  return {
+    ...trayStatus(),
+    show: Boolean(getSetting('tray_icon')),
+    start_with_windows: Boolean(uiSettings().start_with_windows),
+  };
 }));
 
 app.post('/api/shutdown', wrap((req, res) => {
@@ -632,6 +647,7 @@ let shuttingDown = false;
 async function shutdown(code = 0) {
   if (shuttingDown) return;
   shuttingDown = true;
+  trayShuttingDown();
   console.log('Shutting down: stopping active runs…');
   await stopAllRuns(25_000);
   try {
@@ -694,6 +710,7 @@ if (getSetting('start_with_windows')) {
 for (const p of listProjects()) {
   if (!fs.existsSync(p.folder)) console.log(`Project "${p.name}": its folder was not found on this computer (${p.folder}). Choose its location in the project's Setup tab.`);
 }
+initTray(result.port);
 
 try {
   const keyResult = importKeyFile();

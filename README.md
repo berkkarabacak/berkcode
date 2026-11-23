@@ -41,6 +41,17 @@ If you use Kimi: Settings → **Kimi Code CLI** shows whether Kimi is installed 
 
 A **Claude Agent Runner** icon is added to your desktop. Use it to open the app from now on.
 
+While the app runs, its icon also sits **next to the clock**. Windows may hide new icons behind the small arrow (**^**); drag it from there onto the taskbar to always see it.
+
+| Icon next to the clock | Meaning |
+| --- | --- |
+| App icon | Running, waiting for the next scheduled session (hover over it to see when) |
+| With a **blue** dot | Working on a project right now |
+| With a **red** dot | Something needs your attention: click it and the app shows what |
+| No icon | The app is not running: double-click the desktop icon |
+
+Click the icon to open the app; right-click it to turn *Start with Windows* on or off, or to quit the app.
+
 > Tip: if you put a file called `claudeapi.key` containing your API key next to `start.bat`, the app picks the key up automatically.
 
 ## First-time setup (about 2 minutes)
@@ -68,7 +79,7 @@ A **Claude Agent Runner** icon is added to your desktop. Use it to open the app 
 
 **To steer the agent**, edit the **Brief** or the **Plan** between sessions. The next session follows your changes.
 
-**Scheduled sessions only happen while the app is running.** In **Settings**, turn on *Start the app automatically when I log in to Windows* so you don't have to think about it. If the computer was off at the scheduled time, the app does that session once when it starts again.
+**Scheduled sessions only happen while the app is running.** The first time you turn a schedule on, the app asks whether it should start by itself when you log in to Windows: say **Yes**, so a Windows restart (for example an update during the night) does not stop your projects. You can change it later in **Settings** or in the menu of the icon next to the clock. If the computer was off at the scheduled time, the app does that session once when it starts again.
 
 ## Safety and cost
 
@@ -83,7 +94,8 @@ A **Claude Agent Runner** icon is added to your desktop. Use it to open the app 
 
 | Problem | What to do |
 | --- | --- |
-| The page says **"The app is not running"** | Double-click the **Claude Agent Runner** icon on the desktop (or `start.bat`). |
+| The page says **"The app is not running"**, or there is no icon next to the clock | Double-click the **Claude Agent Runner** icon on the desktop (or `start.bat`). |
+| The icon next to the clock has a **red dot** | Click it to open the app, which shows what needs your attention. (Right-clicking the icon lists it too.) |
 | A session failed with **"API key was rejected"** | Settings → paste a fresh key → **Test key**. |
 | A session failed with a **billing** message | Add credit in the Claude Console (Billing). |
 | A Kimi session failed with **"not logged in"** or **"not installed"** | Settings → **Kimi Code CLI** → **Log in to Kimi** (or **Install Kimi Code CLI**), follow the window, then press **Check again**. |
@@ -139,5 +151,6 @@ Good to know:
 - **Claude** runs in-process through the Agent SDK with streaming input, so Stop and the time limit interrupt the agent gracefully and still report cost. On a resumed session the SDK reports cost cumulatively, and the runner subtracts what was spent before.
 - **Kimi** runs as `kimi acp` (Agent Client Protocol over stdio, `src/agents/kimi.js`). The memory tools are attached per session as an HTTP MCP server served by the app itself at `/mcp/<one-time token>` (`src/mcpHttp.js`), so nothing is written to Kimi's config or the project folder and the tool names match Claude's (`mcp__agent_memory__memory`). Sessions continue with `session/load`, Stop uses `session/cancel`, and runs use Never Ask mode. Kimi's own per-turn step limit ends a turn silently (it reports a normal end), so it is switched off (`KIMI_LOOP_MAX_STEPS_PER_TURN=0`) and the app counts tool calls itself and cancels at the limit. Kimi may end a turn and start another one by itself (for example after a background task), so a session only counts as finished after 10 quiet seconds with no tool running. `test/fixtures/fake-kimi.mjs` stands in for Kimi in the tests.
 - Portability: project folders inside the app folder are stored relative to it (`src/projects.js`); folder paths are compared in canonical form (8.3 short names and links resolved, `src/paths.js`); `data/runtime.json` records the app folder, so a copied file never makes one copy mistake another for itself; each project remembers the folder its agent session ran in (`session_folder`) and starts a fresh session when that changes; the desktop icon and the Startup entry are only created or taken over when they are missing or point at a folder that no longer exists. Because people copy the folder while the app runs in the background, the write-ahead log is folded into `app.db` after every idle heartbeat and every run (`checkpoint()` in `src/db.js`), and at startup a damaged database is set aside and replaced by the newest daily backup, with a banner explaining it.
+- The icon next to the clock is `scripts/tray.ps1` (Windows PowerShell 5.1 + Windows Forms, so no native modules or compiled binaries). The server starts it (`src/tray.js`) only when it was started by the launcher; it polls `GET /api/tray` every 2 seconds (state, tooltip and menu lines from `src/status.js`) and closes itself when the server process is gone or the icon is switched off in Settings. It is launched through a short-lived `Start-Process`, because Node kills its direct children together with itself (which would leave a dead icon until the mouse passes over it) and Windows PowerShell started as a detached process without a console exits at once. If the icon stops checking in, the server starts it again (at most 4 times an hour). `-SelfTest` builds the icon and menu without showing them.
 - Default memory templates are in `src/templates.js`. The standing instructions are in `src/prompt.js`.
 - Development: `npm install`, then `node src/launcher.js` (or `node src/server.js --port=4290`). Tests: `npm test`.

@@ -17,6 +17,10 @@ export const DEFAULTS = {
   heartbeat: '',
   // Set when a damaged database was replaced by its backup at startup (JSON); cleared when the owner presses OK.
   db_recovered: '',
+  // The icon next to the clock (scripts/tray.ps1) while the app runs.
+  tray_icon: true,
+  // The owner was asked once whether the app should start with Windows.
+  autostart_prompted: false,
 };
 
 /** Allowed ranges for numeric settings; out-of-range or non-numeric values fall back to the default. */
@@ -28,7 +32,7 @@ const NUMERIC = {
   port: [1024, 65535],
   backup_size_limit_mb: [10, 100000],
 };
-const BOOLEAN = new Set(['start_with_windows', 'catch_up_missed']);
+const BOOLEAN = new Set(['start_with_windows', 'catch_up_missed', 'tray_icon', 'autostart_prompted']);
 const PRIVATE = new Set(['api_key', 'heartbeat', 'key_file_hash']);
 
 const getStmt = db.prepare('SELECT value FROM settings WHERE key = ?');

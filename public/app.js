@@ -101,11 +101,11 @@ function modal(html, onMount) {
   return close;
 }
 
-function confirmModal(title, message, confirmLabel = 'Confirm', danger = true) {
+function confirmModal(title, message, confirmLabel = 'Confirm', danger = true, cancelLabel = 'Cancel') {
   return new Promise((resolve) => {
     modal(
       `<h2>${esc(title)}</h2><p>${message}</p>
-       <div class="row" style="justify-content:flex-end"><button data-close>Cancel</button>
+       <div class="row" style="justify-content:flex-end"><button data-close>${esc(cancelLabel)}</button>
        <button class="${danger ? 'danger' : 'primary'}" id="confirm-yes">${esc(confirmLabel)}</button></div>`,
       (el, close) => {
         $('[data-close]', el).addEventListener('click', () => resolve(false));
@@ -186,6 +186,7 @@ async function refreshState() {
   state.budgetPaused = s.budget_paused;
   state.monthCost = s.month_cost;
   state.canRestart = s.can_restart;
+  state.trayAvailable = s.tray_available;
   state.counts = { all: s.project_count, claude: s.claude_projects, kimi: s.kimi_projects };
   renderBanner();
   // Kimi projects need Kimi Code CLI on this computer (for example after copying the app to a new PC).
@@ -228,6 +229,27 @@ function renderBanner() {
   b.innerHTML = parts.join('');
   $('#resume-budget')?.addEventListener('click', () => attempt(() => api('POST', '/api/budget/resume'), 'Schedules resumed').then(refreshState));
   $('#db-recovered-ok')?.addEventListener('click', () => attempt(() => api('PUT', '/api/settings', { db_recovered: '' })).then(refreshState));
+}
+
+/**
+ * Asked once, at the moment a schedule is switched on: scheduled sessions only happen while the app runs, so after
+ * a Windows restart (for example an update during the night) nothing would run until someone opens the app again.
+ */
+async function offerStartWithWindows() {
+  if (!state.settings || state.settings.start_with_windows || state.settings.autostart_prompted) return;
+  state.settings.autostart_prompted = true;
+  api('PUT', '/api/settings', { autostart_prompted: true }).catch(() => {});
+  const yes = await confirmModal(
+    'Keep working after the computer restarts?',
+    'Scheduled sessions only happen while this app is running. When Windows restarts, for example for an update during the night, the app stays off until someone opens it again.<br/><br/>Let the app start by itself, quietly in the background, whenever you log in to Windows? <b>Recommended.</b>',
+    'Yes, start with Windows',
+    false,
+    'Not now'
+  );
+  if (yes && (await attempt(() => api('PUT', '/api/settings', { start_with_windows: true }), 'The app will now start by itself when you log in to Windows.'))) {
+    await refreshState();
+    if (state.route?.name === 'dashboard') renderDashboard();
+  }
 }
 
 function setNav(name) {
@@ -327,7 +349,12 @@ async function renderDashboard() {
   $$('[data-run]').forEach((b) => b.addEventListener('click', () => runNow(b.dataset.run)));
   $$('[data-stop]').forEach((b) => b.addEventListener('click', () => stopRunFor(b.dataset.stop)));
   $$('[data-toggle]').forEach((b) =>
-    b.addEventListener('click', () => attempt(() => api('POST', `/api/projects/${b.dataset.toggle}/enabled`, { enabled: b.dataset.enabled !== '1' })).then(renderDashboard))
+    b.addEventListener('click', async () => {
+      const enabling = b.dataset.enabled !== '1';
+      const ok = await attempt(() => api('POST', `/api/projects/${b.dataset.toggle}/enabled`, { enabled: enabling }));
+      await renderDashboard();
+      if (ok && enabling) offerStartWithWindows();
+    })
   );
 }
 
@@ -619,6 +646,7 @@ async function renderNewProject() {
     if (p) {
       toast('Project created. Press "Run now" to start the first session.');
       location.hash = `#/project/${p.id}/runs`;
+      if (p.enabled) offerStartWithWindows();
     }
   });
 }
@@ -676,8 +704,9 @@ function renderProjectHeader() {
   $('#hdr-folder').addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'folder' })));
   $('#hdr-index')?.addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'index' })));
   $('#hdr-toggle').addEventListener('click', async () => {
-    await attempt(() => api('POST', `/api/projects/${p.id}/enabled`, { enabled: !p.enabled }), p.enabled ? 'Schedule paused' : 'Schedule resumed');
+    const ok = await attempt(() => api('POST', `/api/projects/${p.id}/enabled`, { enabled: !p.enabled }), p.enabled ? 'Schedule paused' : 'Schedule resumed');
     await refreshProjectHeader();
+    if (ok && !p.enabled) offerStartWithWindows();
   });
 }
 
@@ -814,8 +843,10 @@ function renderScheduleTab(el) {
   wireScheduleEditor(box);
   box.addEventListener('input', () => (state.editing = true));
   $('#sched-enabled').addEventListener('change', async (e) => {
-    await attempt(() => api('POST', `/api/projects/${p.id}/enabled`, { enabled: e.target.checked }), e.target.checked ? 'Schedule turned on' : 'Schedule paused');
+    const enabling = e.target.checked;
+    const ok = await attempt(() => api('POST', `/api/projects/${p.id}/enabled`, { enabled: enabling }), enabling ? 'Schedule turned on' : 'Schedule paused');
     await refreshProjectHeader();
+    if (ok && enabling) offerStartWithWindows();
   });
   $('#save-schedule').addEventListener('click', async () => {
     const { schedule, timezone } = readSchedule(box);
@@ -1346,6 +1377,7 @@ async function renderSettings() {
         <h2 style="margin-top:0">App</h2>
         <label class="inline-choice"><input type="checkbox" name="catch_up_missed" ${s.catch_up_missed ? 'checked' : ''}/> Run once at startup if a scheduled run was missed while the app was closed</label>
         <label class="inline-choice"><input type="checkbox" name="start_with_windows" ${s.start_with_windows ? 'checked' : ''}/> Start the app automatically when I log in to Windows (runs in the background)</label>
+        ${state.trayAvailable ? `<label class="inline-choice"><input type="checkbox" name="tray_icon" ${s.tray_icon ? 'checked' : ''}/> Show an icon next to the clock while the app runs (blue dot: working, red dot: needs your attention)</label>` : ''}
         <label>Backup size limit (MB) <span class="hint">zip restore points are skipped for bigger folders</span></label>
         <input type="number" name="backup_size_limit_mb" min="10" value="${esc(s.backup_size_limit_mb)}"/>
         <label>Port <span class="hint">takes effect after restarting the app</span></label>
@@ -1512,6 +1544,7 @@ async function renderSettings() {
       port: Number(form.port.value) || 4280,
     };
     if (form.api_key.value.trim()) body.api_key = form.api_key.value.trim();
+    if (form.tray_icon) body.tray_icon = form.tray_icon.checked;
     if (await attempt(() => api('PUT', '/api/settings', body), 'Settings saved')) {
       state.models = null;
       await renderSettings();
