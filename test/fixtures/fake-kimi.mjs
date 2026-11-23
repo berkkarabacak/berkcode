@@ -1,7 +1,7 @@
 // A stand-in for "kimi acp" used by the tests: speaks the Agent Client Protocol over stdin/stdout,
 // reads and writes the project memory through the MCP address it is given, and edits files in its folder.
 // Behaviour switches come from markers in the prompt: [fake:no-progress], [fake:slow], [fake:loop], [fake:answer],
-// [fake:continues], [fake:wait] (1.5 s before working) or [fake:wait=<ms>].
+// [fake:continues], [fake:fail] (an error after the first step), [fake:wait] (1.5 s before working) or [fake:wait=<ms>].
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -84,6 +84,10 @@ async function prompt(params) {
   if (wait) await sleep(Number(wait[1] ?? 1500));
   update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Checking memory first. ' } });
   await tool(sid, 'mcp__agent_memory__memory', 'other', { command: 'view', path: '/memories' }, () => memoryCall(session, { command: 'view', path: '/memories' }));
+  if (/\[fake:fail\]/.test(text)) {
+    // The session breaks after some work, for example because it has grown too long for the model.
+    throw Object.assign(new Error('Internal error: the conversation is too long for the model'), { code: -32603 });
+  }
   if (/\[fake:slow\]/.test(text)) {
     for (let i = 0; i < 300 && !cancelled.has(sid); i++) await sleep(100);
     return { stopReason: cancelled.has(sid) ? 'cancelled' : 'end_turn' };

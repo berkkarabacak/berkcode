@@ -629,13 +629,20 @@ app.get('/api/events', (req, res) => {
   res.set({ 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-cache', Connection: 'keep-alive' });
   res.flushHeaders();
   res.write('retry: 3000\n\n');
-  const send = (event) => res.write(`data: ${JSON.stringify(event)}\n\n`);
+  // Only write while the browser is still connected; a write after the connection ended would raise an error.
+  const write = (chunk) => {
+    if (!res.writableEnded && !res.destroyed) res.write(chunk);
+  };
+  const send = (event) => write(`data: ${JSON.stringify(event)}\n\n`);
   bus.on('event', send);
-  const ping = setInterval(() => res.write(': ping\n\n'), 25_000);
-  req.on('close', () => {
+  const ping = setInterval(() => write(': ping\n\n'), 25_000);
+  const stop = () => {
     clearInterval(ping);
     bus.off('event', send);
-  });
+  };
+  req.on('close', stop);
+  res.on('close', stop);
+  res.on('error', stop);
 });
 
 // ---------- Memory tools for agents that run as separate programs (Kimi) ----------

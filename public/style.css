@@ -212,6 +212,7 @@ tr.clickable:hover td { background: #faf7f1; }
 .markdown pre { background: #f4f2ec; padding: 10px 12px; border-radius: 8px; overflow-x: auto; }
 .markdown code { background: #f1eee6; padding: 1px 5px; border-radius: 4px; font-size: .88em; }
 .markdown pre code { background: none; padding: 0; }
+.markdown a:not([href]) { color: inherit; }
 .plan-step { display: grid; grid-template-columns: 150px 1fr auto; gap: 8px; align-items: start; padding: 6px 0; border-bottom: 1px dashed var(--border); }
 .plan-step.done input[type=text] { text-decoration: line-through; color: var(--muted); }
 .plan-step .details { grid-column: 2 / 3; font-size: 13px; color: var(--muted); white-space: pre-wrap; }

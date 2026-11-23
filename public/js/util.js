@@ -9,7 +9,29 @@ export const esc = (s) =>
 if (window.marked) {
   window.marked.use({ renderer: { html: (token) => esc(token.text ?? token.raw ?? '') } });
 }
-export const md = (s) => (window.marked ? window.marked.parse(String(s ?? '')) : `<pre>${esc(s)}</pre>`);
+export const md = (s) => (window.marked ? tidyLinks(window.marked.parse(String(s ?? ''))) : `<pre>${esc(s)}</pre>`);
+
+/**
+ * Text written by the agent may contain links and images. Only web and mail links stay clickable, and they open in
+ * a new tab, so the app's page never navigates away (to a project file such as "css/site.css", or to script code).
+ * Images that are not on the web are shown as their description.
+ */
+function tidyLinks(html) {
+  const t = document.createElement('template');
+  t.innerHTML = html;
+  for (const a of t.content.querySelectorAll('a')) {
+    if (/^(https?:|mailto:)/i.test((a.getAttribute('href') ?? '').trim())) {
+      a.target = '_blank';
+      a.rel = 'noopener noreferrer';
+    } else {
+      a.removeAttribute('href');
+    }
+  }
+  for (const img of t.content.querySelectorAll('img')) {
+    if (!/^https?:/i.test((img.getAttribute('src') ?? '').trim())) img.replaceWith(img.getAttribute('alt') ?? '');
+  }
+  return t.innerHTML;
+}
 
 /** Shared UI state. */
 export const state = {

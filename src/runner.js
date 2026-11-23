@@ -174,13 +174,21 @@ function capReached(project) {
   return budgetPaused() || (cap > 0 && monthCost() >= cap);
 }
 
-/** Why the next run should start a fresh session instead of continuing the previous one (or null). */
-export function freshSessionReason(project, limits = effectiveLimits(project)) {
+/** A chat keeps its session this many times longer than scheduled runs do (see freshSessionReason). */
+const CHAT_SESSION_FACTOR = 3;
+
+/**
+ * Why the next run should start a fresh session instead of continuing the previous one (or null). A message from
+ * the owner (`chat`) keeps its conversation going longer: a fresh start in the middle of a chat would make the agent
+ * forget what was just said. The run limit still applies to chats, only higher, so a session cannot grow forever.
+ */
+export function freshSessionReason(project, limits = effectiveLimits(project), { chat = false } = {}) {
   if (!project.session_id) return 'no previous session';
-  if (project.fresh_pending) return 'a fresh session was requested';
+  if (project.fresh_pending) return project.fresh_after_failure ? 'the previous session ended with a problem' : 'a fresh session was requested';
   // The previous session knows the old location; continuing it could make the agent work in the old folder.
   if (project.session_folder && !samePath(project.session_folder, project.folder)) return 'the project folder has moved';
-  if (project.runs_on_session >= project.fresh_every) return `${project.runs_on_session} runs on the previous session`;
+  const maxRuns = chat ? project.fresh_every * CHAT_SESSION_FACTOR : project.fresh_every;
+  if (project.runs_on_session >= maxRuns) return `${project.runs_on_session} runs on the previous session`;
   if (project.agent === 'kimi') {
     const last = db
       .prepare('SELECT model, effort FROM runs WHERE project_id = ? AND session_id = ? AND model IS NOT NULL ORDER BY id DESC LIMIT 1')
@@ -216,11 +224,11 @@ export function startRun(projectId, trigger = 'manual', { message = null, newCon
   if (active.has(projectId)) return recordSkipped(project, trigger, 'skipped: previous run still active');
   if (capReached(project)) return recordSkipped(project, trigger, 'skipped: monthly budget cap reached');
 
-  if (newConversation && !project.fresh_pending) {
+  if (newConversation && (!project.fresh_pending || project.fresh_after_failure)) {
     setProjectFields(projectId, { fresh_pending: 1 });
     project = getProject(projectId);
   }
-  const freshReason = freshSessionReason(project);
+  const freshReason = freshSessionReason(project, undefined, { chat: Boolean(message) });
   const res = insertRun.run(projectId, trigger, now(), 'running', null, null, project.agent);
   const runId = Number(res.lastInsertRowid);
   const conversationId = pickConversation(project, runId, freshReason, newConversation);
@@ -277,7 +285,7 @@ async function executeRun(project, runId, ctx) {
   const log = (type, content) => {
     const entry = { runId, projectId, seq: ++seq, ts: now(), type, content: redact(content) };
     insertLog.run(runId, entry.seq, entry.ts, type, entry.content);
-    emit('log', entry);
+    emit('log', { ...entry, conversationId: ctx.conversationId });
   };
   if (chat) log('user', ctx.message);
 
@@ -480,6 +488,9 @@ async function executeRun(project, runId, ctx) {
       }
       if (status === 'failed') {
         fields.consecutive_failures = latest.consecutive_failures + 1;
+        // A session that ended with a problem is not continued: if the session itself is the cause (for example it
+        // has grown too long for the model), every later run would fail the same way. Memory carries the state over.
+        if (sessionId) fields.fresh_pending = 2;
         if (fields.consecutive_failures >= 3 && latest.enabled) {
           fields.enabled = 0;
           fields.paused_reason = `The schedule was paused after 3 failed runs in a row. Last problem: ${redact(error ?? 'unknown').slice(0, 300)}`;

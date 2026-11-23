@@ -195,8 +195,8 @@ function entryHtml(turn, e) {
     case 'warning':
       return e.content === 'Stopped by the owner.' ? '' : `<div class="note warn">${icon('alert', 14)}<span>${esc(e.content)}</span></div>`;
     case 'system':
-      // A chat the owner started is obviously a new session; for scheduled ones the reason is worth showing.
-      if (turn.run.user_message && /^Starting a fresh/.test(e.content)) return '';
+      // A new chat is obviously a fresh session; other reasons (a changed model, a long session) are worth showing.
+      if (turn.run.user_message && /^Starting a fresh .*\((no previous session|a fresh session was requested)\)/.test(e.content)) return '';
       return SHOWN_SYSTEM.test(e.content) ? `<div class="note">${esc(e.content)}</div>` : '';
     default:
       // "error" and "result" are summed up in the line under the run.
@@ -311,8 +311,9 @@ async function restoreBefore(run) {
 
 async function loadEarlier(firstRunId) {
   if (!view || !firstRunId) return;
+  const shown = view;
   const data = await attempt(() => api('GET', `/api/projects/${view.projectId}/conversations/${view.conversationId}?before=${firstRunId}`));
-  if (!data || !view) return;
+  if (!data || view !== shown) return;
   const height = view.scroll.scrollHeight;
   for (const run of [...data.runs].reverse()) addTurn(run, { prepend: true });
   view.scroll.scrollTop += view.scroll.scrollHeight - height;
@@ -461,6 +462,28 @@ function renderComposerState() {
       : `Messages you send now wait in the queue. ${label} gets them one at a time, each when it finishes its current reply.`;
 }
 
+// Unsent text in the message box is kept in this browser, so a reload or a crash of the browser does not lose it.
+const DRAFT_PREFIX = 'draft:';
+
+function loadDraft(key) {
+  if (key in state.drafts) return state.drafts[key];
+  try {
+    return localStorage.getItem(DRAFT_PREFIX + key) ?? '';
+  } catch {
+    return '';
+  }
+}
+
+function saveDraft(key, text) {
+  state.drafts[key] = text;
+  try {
+    if (text.trim()) localStorage.setItem(DRAFT_PREFIX + key, text);
+    else localStorage.removeItem(DRAFT_PREFIX + key);
+  } catch {
+    /* storage blocked or full: the draft stays in this page only */
+  }
+}
+
 function wireComposer(isNew) {
   const form = $('#composer', view.el);
   const input = $('#composer-input', view.el);
@@ -471,10 +494,10 @@ function wireComposer(isNew) {
     input.style.height = `${Math.min(input.scrollHeight, 260)}px`;
     send.disabled = !input.value.trim();
   };
-  input.value = state.drafts[key] ?? '';
+  input.value = loadDraft(key);
   resize();
   input.addEventListener('input', () => {
-    state.drafts[key] = input.value;
+    saveDraft(key, input.value);
     resize();
   });
   input.addEventListener('keydown', (e) => {
@@ -492,7 +515,7 @@ function wireComposer(isNew) {
     const conversation = view.conversationId;
     try {
       const r = await api('POST', `/api/projects/${projectId}/chat`, { message, new_conversation: isNew });
-      delete state.drafts[key];
+      saveDraft(key, '');
       if (!view || view.projectId !== projectId || view.conversationId !== conversation) return;
       input.value = '';
       resize();
@@ -528,22 +551,27 @@ function wireComposer(isNew) {
 export function chatOnLog(entry) {
   if (!view || entry.projectId !== view.projectId) return;
   const turn = view.turns.get(entry.runId);
-  if (!turn) {
-    if (!view.pending.has(entry.runId)) view.pending.set(entry.runId, []);
-    view.pending.get(entry.runId).push(entry);
+  if (turn) {
+    appendEntry(turn, entry);
+    scrollToBottom();
     return;
   }
-  appendEntry(turn, entry);
-  scrollToBottom();
+  // A run of this conversation that is not shown yet (it is being loaded): keep its lines until it is.
+  if (entry.conversationId !== view.conversationId) return;
+  if (!view.pending.has(entry.runId)) view.pending.set(entry.runId, []);
+  const lines = view.pending.get(entry.runId);
+  if (lines.length < 5000) lines.push(entry);
 }
 
 export async function chatOnRunUpdated(ev) {
   if (!view || ev.projectId !== view.projectId) return;
   const turn = view.turns.get(ev.runId);
-  const mine = turn || (ev.conversationId === view.conversationId && ev.status === 'running');
+  const mine = turn || (ev.conversationId != null && ev.conversationId === view.conversationId);
+  if (!mine && ev.status !== 'running') view.pending.delete(ev.runId);
   if (mine) {
+    const shown = view;
     const run = await api('GET', `/api/runs/${ev.runId}`).catch(() => null);
-    if (!run || !view || ev.projectId !== view.projectId) return;
+    if (!run || view !== shown) return; // another conversation was opened meanwhile
     if (run.conversation_id !== view.conversationId && view.turns.has(run.id)) {
       // The run moved to a new conversation (the old agent session could not be continued).
       showMoved(run.conversation_id, 'because the previous session could not be continued');

@@ -718,7 +718,7 @@ async function renderSetupTab(el) {
         <div><label>Time limit (minutes)</label><input type="number" name="max_minutes" min="1" value="${esc(p.max_minutes ?? '')}" placeholder="${esc(s.default_max_minutes)}"/></div>
         <div><label>Fresh session every N runs</label><input type="number" name="fresh_every" min="1" value="${esc(p.fresh_every)}"/></div>
       </div>
-      <p class="muted small">Leave a limit empty to use the default from Settings.${kimi ? ' Kimi runs use your subscription, so there is no dollar budget per run.' : ''}${kimi ? ' Changing the model or thinking level starts a fresh Kimi session on the next run.' : ''}</p>
+      <p class="muted small">Leave a limit empty to use the default from Settings.${kimi ? ' Kimi runs use your subscription, so there is no dollar budget per run.' : ''}${kimi ? ' Changing the model or thinking level starts a fresh Kimi session on the next run.' : ''} A fresh session starts a new conversation; when you are chatting, it waits until three times as many runs, so the agent does not forget the chat.</p>
 
       <div class="row" style="margin-top:18px"><button class="primary" type="submit">Save</button></div>
     </form>
@@ -1480,50 +1480,89 @@ function showOffline() {
   document.body.append(el);
 }
 
+function onEventsOpen() {
+  clearTimeout(offlineTimer);
+  offlineTimer = null;
+  if (offline) {
+    offline = false;
+    $('#offline')?.remove();
+  }
+  if (missedEvents) {
+    missedEvents = false;
+    refreshState().catch(() => {});
+    refreshSidebarSoon();
+    if (!state.editing) router();
+  }
+}
+
+function onEventsError() {
+  missedEvents = true;
+  if (!offlineTimer && !offline) {
+    offlineTimer = setTimeout(() => {
+      offlineTimer = null;
+      offline = true;
+      showOffline();
+    }, 4000);
+  }
+}
+
+/**
+ * Live updates. All open pages of the app share one connection through a SharedWorker (js/events-worker.js):
+ * browsers allow only about six connections to the app, so a page each would let a few tabs freeze the app.
+ */
 function connectEvents() {
+  if (window.SharedWorker) {
+    try {
+      const worker = new SharedWorker('/js/events-worker.js', { name: 'live-updates' });
+      let heard = false;
+      worker.port.onmessage = (m) => {
+        heard = true;
+        if (m.data.kind === 'open') onEventsOpen();
+        else if (m.data.kind === 'error') onEventsError();
+        else if (m.data.kind === 'event') onServerEvent(JSON.parse(m.data.data));
+      };
+      worker.onerror = () => {
+        // The shared connection could not start: this page connects by itself instead.
+        if (!heard) connectOwnEvents();
+      };
+      worker.port.start();
+      window.addEventListener('pagehide', () => worker.port.postMessage('bye'));
+      return;
+    } catch {
+      /* no shared workers here: fall through */
+    }
+  }
+  connectOwnEvents();
+}
+
+function connectOwnEvents() {
   const es = new EventSource('/api/events');
-  es.onopen = () => {
-    clearTimeout(offlineTimer);
-    offlineTimer = null;
-    if (offline) {
-      offline = false;
-      $('#offline')?.remove();
-    }
-    if (missedEvents) {
-      missedEvents = false;
-      refreshState().catch(() => {});
-      refreshSidebarSoon();
-      if (!state.editing) router();
-    }
-  };
+  es.onopen = onEventsOpen;
   es.onerror = () => {
-    missedEvents = true;
-    if (es.readyState === EventSource.CLOSED) setTimeout(connectEvents, 3000);
-    if (!offlineTimer && !offline) {
-      offlineTimer = setTimeout(() => {
-        offlineTimer = null;
-        offline = true;
-        showOffline();
-      }, 4000);
-    }
+    onEventsError();
+    if (es.readyState === EventSource.CLOSED) setTimeout(connectOwnEvents, 3000);
   };
-  es.onmessage = (msg) => {
-    const ev = JSON.parse(msg.data);
-    if (ev.type === 'log') chatOnLog(ev.data);
-    else if (ev.type === 'run-updated') {
-      chatOnRunUpdated(ev.data);
-      refreshCurrent();
-    } else if (['projects-changed', 'budget-paused', 'chat-queued'].includes(ev.type)) {
-      if (ev.type === 'chat-queued') chatOnQueue(ev.data);
-      refreshCurrent();
-    }
-    else if (ev.type === 'memory-changed' && state.route?.tab === 'memory' && !state.editing) {
-      loadMemory().then(renderMemorySection);
-    }
-  };
+  es.onmessage = (msg) => onServerEvent(JSON.parse(msg.data));
+}
+
+function onServerEvent(ev) {
+  if (ev.type === 'log') chatOnLog(ev.data);
+  else if (ev.type === 'run-updated') {
+    chatOnRunUpdated(ev.data);
+    refreshCurrent();
+  } else if (['projects-changed', 'budget-paused', 'chat-queued'].includes(ev.type)) {
+    if (ev.type === 'chat-queued') chatOnQueue(ev.data);
+    refreshCurrent();
+  } else if (ev.type === 'memory-changed' && state.route?.tab === 'memory' && !state.editing) {
+    loadMemory().then(renderMemorySection);
+  }
 }
 
 window.addEventListener('hashchange', router);
+// A page the browser brings back from its back/forward cache has left the shared live updates: load it afresh.
+window.addEventListener('pageshow', (e) => {
+  if (e.persisted) location.reload();
+});
 window.addEventListener('beforeunload', (e) => {
   if (state.editing) e.preventDefault();
 });

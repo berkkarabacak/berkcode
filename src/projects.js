@@ -59,6 +59,8 @@ function hydrate(row) {
     schedule,
     enabled: Boolean(row.enabled),
     fresh_pending: Boolean(row.fresh_pending),
+    // 1: the owner asked for a fresh session; 2: the previous session ended with a problem (see runner.js).
+    fresh_after_failure: row.fresh_pending === 2,
   };
 }
 

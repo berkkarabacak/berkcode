@@ -21,7 +21,7 @@ const { createProject, getProject } = await import('../src/projects.js');
 const { ensureStandardEntries } = await import('../src/memory.js');
 const {
   startRun, stopRun, stopAllRuns, activeRunId, queueMessage, queuedMessages, sendMessage, releaseQueued, removeQueued, clearQueue,
-  holdQueueAfterRestart,
+  holdQueueAfterRestart, freshSessionReason,
 } = await import('../src/runner.js');
 const { listConversations } = await import('../src/conversations.js');
 const { db } = await import('../src/db.js');
@@ -275,6 +275,80 @@ test('the queue is kept in the database; after a restart nothing is sent by itse
   assert.deepEqual(queuedMessages(project.id).map((m) => m.id), [kept.id]);
   clearQueue(project.id);
   assert.equal(queuedMessages(project.id).length, 0);
+});
+
+async function waitIdleFor(projectId) {
+  for (let i = 0; i < 400 && activeRunId(projectId); i++) await sleep(100);
+  assert.equal(activeRunId(projectId), null, 'the run did not finish in time');
+}
+
+const longChatFolder = path.join(tmp, 'long-chat');
+fs.mkdirSync(longChatFolder, { recursive: true });
+const longChat = createProject({ name: 'Long chat', folder: longChatFolder, agent: 'kimi', task_prompt: 'Keep going.', schedule: { type: 'interval', minutes: 30 }, fresh_every: 2 });
+ensureStandardEntries(longChat.id);
+
+async function runIn(projectId, trigger, message = null) {
+  const { runId } = startRun(projectId, trigger, message ? { message } : {});
+  await waitIdleFor(projectId);
+  return run(runId);
+}
+
+test('a chat keeps its conversation longer than scheduled runs do, so the agent does not forget the chat', async () => {
+  const first = await runIn(longChat.id, 'chat', 'Message one');
+  const second = await runIn(longChat.id, 'chat', 'Message two');
+  const third = await runIn(longChat.id, 'chat', 'Message three'); // the second run on the session: a scheduled run would start fresh
+  for (const r of [first, second, third]) assert.equal(r.status, 'success', r.error);
+  assert.deepEqual([first, second, third].map((r) => r.conversation_id), [first.id, first.id, first.id]);
+  assert.deepEqual([second, third].map((r) => r.session_mode), ['resumed', 'resumed']);
+
+  const scheduled = await runIn(longChat.id, 'schedule');
+  assert.equal(scheduled.session_mode, 'fresh');
+  assert.equal(scheduled.conversation_id, scheduled.id);
+  assert.ok(scheduled.logs.some((l) => l.type === 'system' && /Starting a fresh .*3 runs on the previous session/.test(l.content)));
+
+  // The limit still applies to chats, three times as high.
+  const p = getProject(longChat.id);
+  assert.equal(freshSessionReason({ ...p, runs_on_session: 5 }, undefined, { chat: true }), null);
+  assert.equal(freshSessionReason({ ...p, runs_on_session: 6 }, undefined, { chat: true }), '6 runs on the previous session');
+  assert.equal(freshSessionReason({ ...p, runs_on_session: 2 }), '2 runs on the previous session');
+});
+
+test('if the agent session cannot be continued, a chat message starts fresh with the memory snapshot, in a new conversation', async () => {
+  const p = getProject(longChat.id);
+  // Kimi lost the session (for example after an update): drop it from the fake's saved sessions.
+  const stateFile = path.join(tmp, 'sessions.json');
+  const saved = JSON.parse(fs.readFileSync(stateFile, 'utf8'));
+  assert.ok(saved.sessions[p.session_id], 'the session exists before');
+  delete saved.sessions[p.session_id];
+  fs.writeFileSync(stateFile, JSON.stringify(saved));
+
+  const r = await runIn(longChat.id, 'chat', 'Are you still there?');
+  assert.equal(r.status, 'success', r.error);
+  assert.equal(r.session_mode, 'fresh (resume failed)');
+  assert.equal(r.conversation_id, r.id, 'the run moved to a new conversation');
+  assert.notEqual(r.conversation_id, p.conversation_id);
+  assert.equal(getProject(longChat.id).conversation_id, r.id);
+  const sent = prompts().filter((x) => x.sessionId === r.session_id)[0].text;
+  assert.match(sent, /<brief path="\/memories\/brief\.md">/);
+  assert.match(sent, /# Message from the owner\n\nAre you still there\?/);
+});
+
+test('after a session ends with a problem, the next run starts fresh instead of continuing the broken session', async () => {
+  const failed = await runIn(longChat.id, 'chat', '[fake:fail] Do something that breaks the session');
+  assert.equal(failed.status, 'failed');
+  assert.ok(failed.turns > 0, 'the session did some work first');
+  let p = getProject(longChat.id);
+  assert.equal(p.fresh_pending, true);
+  assert.equal(p.fresh_after_failure, true);
+
+  const next = await runIn(longChat.id, 'chat', 'Try again please');
+  assert.equal(next.status, 'success', next.error);
+  assert.equal(next.session_mode, 'fresh');
+  assert.equal(next.conversation_id, next.id, 'it starts a new conversation');
+  assert.ok(next.logs.some((l) => l.type === 'system' && /Starting a fresh .*\(the previous session ended with a problem\)/.test(l.content)));
+  p = getProject(longChat.id);
+  assert.equal(p.fresh_pending, false);
+  assert.equal(p.consecutive_failures, 0);
 });
 
 test('runs made before conversations existed are grouped by agent session', () => {
