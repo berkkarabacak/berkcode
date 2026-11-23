@@ -1,6 +1,6 @@
 # Claude Agent Runner
 
-Claude Agent Runner lets Claude build a software project for you **step by step, on a schedule**, while you are away.
+Claude Agent Runner lets an AI agent (Claude or Kimi) build a software project for you **step by step**: when you chat with it, much like in Claude Code, and **on a schedule** while you are away.
 You use it entirely from your web browser. You never need to type commands.
 
 Every session remembers what the earlier sessions did and carries on from there. You can read what happened in each session, and undo any session with one click.
@@ -25,7 +25,7 @@ You choose the agent **once, when you create a project**. It cannot be changed l
 | How it is paid | Your Anthropic API key, per use | Your Kimi Code subscription, no per-use cost |
 | Model | Claude Sonnet 5.5 by default (changeable) | Best available Kimi model (K3.1 Pro) with Max thinking by default (changeable) |
 | Limits per session | Steps, time and money | Steps and time |
-| Memory, schedules, live view, Stop, restore points, run history | ✓ | ✓ (identical) |
+| Chat, message queue, memory, schedules, Stop, restore points, run history | ✓ | ✓ (identical) |
 
 Both agents use the same memory system: every session reads what earlier sessions recorded (brief, plan, progress, decisions, notes) and writes down what it did.
 
@@ -58,26 +58,27 @@ Click the icon to open the app; right-click it to turn *Start with Windows* on o
 
 1. For Claude: **Settings** → paste your API key → press **Test key**. When it says "The key works and has been saved", you are done.
    For Kimi: **Settings** → **Kimi Code CLI** shows whether Kimi is ready. If it is not, press **Install Kimi Code CLI** or **Log in to Kimi**: a window opens and guides you (the login confirms a code on a Kimi web page).
-2. **Projects** → **+ Add project**:
+2. **New project** (top left):
    1. Give it a name, for example *My website*.
    2. Choose **who should do the work**: Claude or Kimi.
    3. A folder is suggested for you inside the app's **`projects`** folder, so the project moves along if you ever copy the app to another computer. You can press **Browse…** to choose another one.
    4. Describe in your own words what should be built.
-   5. Choose when it should work on it: **Repeat every** 15 or 30 minutes or 1–12 hours, **every day** at a set time, or **on selected weekdays**. You can change this later in the **Schedule** tab.
-3. Press **Run now** to start the first session right away and watch it in the **Live** tab.
+   5. Choose when it should work on it: **Repeat every** 15 or 30 minutes or 1–12 hours, **every day** at a set time, or **on selected weekdays**. You can change this later under **Scheduled tasks**.
+3. The project opens with a new chat. Tell the agent what to do first (for example *Start with the home page*) and press **Enter**. You watch it answer and work right away.
 
 ## Every day
 
 | Where | What you can do |
 | --- | --- |
-| **Projects** | See each project's next run, last result and cost. **Run now**, **Pause schedule**, **Open**. |
-| **Runs** tab | Every session: the agent's own summary, which files changed, the full log. **Restore folder to before this run** undoes a session. |
-| **Live** tab | Watch the current session. **Stop** ends it safely. |
+| **Left side** | Your projects, each with its conversations (newest first). **New chat** starts a fresh conversation. A **blue** dot means the agent is working there, a **red** one that something needs your attention. |
+| **Chat** | Type a message and press **Enter**: the agent works on it right away, and you watch its answer and its steps live. Scheduled sessions continue the same conversation. **Stop** ends the agent's work safely. Under each session: how long it took, which files changed, and **Undo: restore the folder to before this**. |
+| **Message queue** | While the agent works, just keep typing. Your messages wait in a list above the message box, and the agent gets them **one at a time**, each when it finishes its current reply. **Edit** (✎) puts a message back into the box, **✕** removes it. After **Stop**, a failed session or a restart, waiting messages are kept but not sent until you press **Send** (or **Send all**). |
+| **Scheduled tasks** (bottom left) | Every project's schedule: switch it **on or off**, **Change schedule** (for example from every 30 minutes to every 2 hours), **Run now**. |
 | **Memory** tab | **Brief** (what to build), **Plan** (a checklist you can edit), **Progress** (one note per session), notes, search, history of every change. |
-| **Schedule** tab | Change when the agent works (for example from every 30 minutes to every 2 hours), or pause it. |
-| **Setup** tab | Name, folder, instructions, model, limits. **Open folder** and **Open website** buttons are at the top. |
+| **Runs** tab | Every session in a list: when, how it went, cost, files changed. Click one to open it in its conversation. |
+| **Setup** tab | Name, folder, instructions, model, limits. The **folder** and **website** buttons are at the top right. |
 
-**To steer the agent**, edit the **Brief** or the **Plan** between sessions. The next session follows your changes.
+**To steer the agent**, tell it in the chat, or edit the **Brief** or the **Plan**. Later sessions follow your changes.
 
 **Scheduled sessions only happen while the app is running.** The first time you turn a schedule on, the app asks whether it should start by itself when you log in to Windows: say **Yes**, so a Windows restart (for example an update during the night) does not stop your projects. You can change it later in **Settings** or in the menu of the icon next to the clock. If the computer was off at the scheduled time, the app does that session once when it starts again.
 
@@ -101,7 +102,7 @@ Click the icon to open the app; right-click it to turn *Start with Windows* on o
 | A Kimi session failed with **"not logged in"** or **"not installed"** | Settings → **Kimi Code CLI** → **Log in to Kimi** (or **Install Kimi Code CLI**), follow the window, then press **Check again**. |
 | A Kimi session failed with **"usage limit"** | Your Kimi subscription's usage window is used up; the next scheduled run tries again. |
 | A project says its **folder was not found** | The folder was moved or not copied along. Open the project → **Setup** → **Browse…** to where it is now → **Save**. |
-| The agent made a mess | Runs tab → open that run → **Restore folder to before this run**. |
+| The agent made a mess | In the chat, under that session: **Undo: restore the folder to before this** (older sessions: **Runs** tab → click the session). |
 | `start.bat` shows an error | Check the internet connection and start it again. If it keeps failing, send the file `data\logs\setup.log` to whoever gave you the app. |
 | Anything else | Settings → **Help & troubleshooting** shows a health check, **Open log folder**, **Restart app** and **Shut down app**. |
 
@@ -148,6 +149,9 @@ Good to know:
 - Storage is Node's built-in `node:sqlite` with FTS5, so nothing needs compiling.
 - Memory lives in SQLite. The Agent SDK cannot plug its native memory tool into custom storage, so the agent gets an MCP tool `memory` (view / create / str_replace / insert / delete / rename, the same semantics as Anthropic's memory tool) plus `memory_search` (`src/memory.js`, `src/memoryTools.js`). Claude Code's own auto-memory is turned off, and the agent's config and transcripts live in `data/agent`.
 - `src/runner.js` holds the run lifecycle shared by both agents; `src/agents/claude.js` and `src/agents/kimi.js` only run the conversation.
+- Chat: a message from the owner is a run with trigger `chat` and `runs.user_message`. Every run belongs to a conversation (`runs.conversation_id`, the id of the run that started it, `src/conversations.js`); a fresh agent session starts a new conversation, so scheduled runs continue the current one. The first message of a conversation gets the memory snapshot (`buildChatPrompt`), later ones a short prompt (`chatTurnPrompt`), and chat sessions use `CHAT_SYSTEM_APPEND` instead of the unattended rules (`src/prompt.js`).
+- Message queue: messages sent while the agent is busy are stored in the `chat_queue` table. The runner hands the first waiting one over at the agent's next pause (the `onTurnEnd` hook of both adapters, one message per turn; Kimi's step limit counts per turn), or starts the next run with it once the run is over. A message for a new chat waits until the current run is over. After Stop, a failed run, or when the app closes, waiting messages get a `held_reason` and are only sent again with `POST /api/projects/:id/queue[/:qid]/send`; nothing is sent by itself after a restart.
+- The browser UI is plain ES modules without a build step: `public/app.js` (sidebar, router, pages), `public/js/chat.js` (conversation view, message box, queue), `public/js/util.js` (helpers and icons). After a lost connection the page reloads its data, because server events may have been missed meanwhile.
 - **Claude** runs in-process through the Agent SDK with streaming input, so Stop and the time limit interrupt the agent gracefully and still report cost. On a resumed session the SDK reports cost cumulatively, and the runner subtracts what was spent before.
 - **Kimi** runs as `kimi acp` (Agent Client Protocol over stdio, `src/agents/kimi.js`). The memory tools are attached per session as an HTTP MCP server served by the app itself at `/mcp/<one-time token>` (`src/mcpHttp.js`), so nothing is written to Kimi's config or the project folder and the tool names match Claude's (`mcp__agent_memory__memory`). Sessions continue with `session/load`, Stop uses `session/cancel`, and runs use Never Ask mode. Kimi's own per-turn step limit ends a turn silently (it reports a normal end), so it is switched off (`KIMI_LOOP_MAX_STEPS_PER_TURN=0`) and the app counts tool calls itself and cancels at the limit. Kimi may end a turn and start another one by itself (for example after a background task), so a session only counts as finished after 10 quiet seconds with no tool running. `test/fixtures/fake-kimi.mjs` stands in for Kimi in the tests.
 - Portability: project folders inside the app folder are stored relative to it (`src/projects.js`); folder paths are compared in canonical form (8.3 short names and links resolved, `src/paths.js`); `data/runtime.json` records the app folder, so a copied file never makes one copy mistake another for itself; each project remembers the folder its agent session ran in (`session_folder`) and starts a fresh session when that changes; the desktop icon and the Startup entry are only created or taken over when they are missing or point at a folder that no longer exists. Because people copy the folder while the app runs in the background, the write-ahead log is folded into `app.db` after every idle heartbeat and every run (`checkpoint()` in `src/db.js`), and at startup a damaged database is set aside and replaced by the newest daily backup, with a banner explaining it.

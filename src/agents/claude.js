@@ -89,12 +89,13 @@ const outcomeOf = (result) => {
  * Runs one Claude session. Returns a result in the shape shared by all agents:
  * { sessionId, resumed, resumeFailedReason, outcomes[], summary, turns, error, fatal, costTotal, model }.
  */
-export async function runClaudeConversation({ ctx, projectId, folder, limits, prompt, resumeId, runId, log, memoryWritten, onTurnEnd }) {
+export async function runClaudeConversation({ ctx, projectId, folder, limits, prompt, freshPrompt = prompt, resumeId, runId, log, memoryWritten, onTurnEnd, systemAppend = SYSTEM_APPEND }) {
   const stderrTail = [];
 
   async function converse(resume) {
     const input = promptQueue();
-    input.push(prompt);
+    // A fresh session (also when continuing the old one failed) needs the full first prompt with the memory snapshot.
+    input.push(resume ? prompt : freshPrompt);
     const r = { sessionId: null, results: [], assistantCount: 0, apiError: null, exception: null };
     const q = query({
       prompt: input,
@@ -113,7 +114,7 @@ export async function runClaudeConversation({ ctx, projectId, folder, limits, pr
         strictMcpConfig: true,
         settingSources: [],
         settings: { autoMemoryEnabled: false },
-        systemPrompt: { type: 'preset', preset: 'claude_code', append: SYSTEM_APPEND },
+        systemPrompt: { type: 'preset', preset: 'claude_code', append: systemAppend },
         env: agentEnv(),
         stderr: (data) => {
           stderrTail.push(redact(String(data)));
@@ -142,7 +143,7 @@ export async function runClaudeConversation({ ctx, projectId, folder, limits, pr
         if (msg.type === 'result') {
           r.results.push(msg);
           const next = !ctx.stopReason && outcomeOf(msg) === 'success' ? onTurnEnd() : null;
-          if (next) input.push(next);
+          if (next) input.push(typeof next === 'string' ? next : next.text);
           else input.close();
         }
       }

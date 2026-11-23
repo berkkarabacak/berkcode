@@ -1,5 +1,6 @@
 // The run lifecycle shared by all agents: lock, checks, restore point, prompt, limits, progress check,
 // change tracking and bookkeeping. The conversation itself is done by an agent adapter (src/agents/*).
+// A run is started by the schedule, by "Run now", or by a message the owner types in the chat.
 import fs from 'node:fs';
 import { db, now, checkpoint } from './db.js';
 import { emit } from './events.js';
@@ -8,13 +9,15 @@ import { getSetting, setSetting } from './settings.js';
 import { redact } from './redact.js';
 import { getProject, setProjectFields, effectiveLimits, monthCost, budgetPaused, currentMonthKey, AGENTS } from './projects.js';
 import { ensureStandardEntries, getEntry, memoryStore, parsePlan } from './memory.js';
-import { buildPrompt, progressFollowUp, sessionStamp, SYSTEM_APPEND } from './prompt.js';
+import { buildPrompt, buildChatPrompt, chatTurnPrompt, progressFollowUp, sessionStamp, SYSTEM_APPEND, CHAT_SYSTEM_APPEND } from './prompt.js';
 import { createRestorePoint, fingerprintFolder, diffFingerprints } from './restorePoints.js';
 import { runClaudeConversation } from './agents/claude.js';
 import { runKimiConversation, KIMI_RULES } from './agents/kimi.js';
 
 const HARD_STOP_MS = 20_000;
+export const PLAN_DONE_NOTE = 'All plan steps are done, so the schedule was paused. Add new steps to the plan, then turn the schedule on again under Scheduled tasks.';
 const ADAPTERS = { claude: runClaudeConversation, kimi: runKimiConversation };
+export const MAX_MESSAGE_LENGTH = 20_000;
 
 /** projectId -> run context */
 const active = new Map();
@@ -28,6 +31,130 @@ export function activeRunId(projectId) {
 export function activeRunCount() {
   return active.size;
 }
+
+/** The conversation the active run of a project belongs to (or null). */
+export function activeConversationId(projectId) {
+  return active.get(Number(projectId))?.conversationId ?? null;
+}
+
+// ---------- The queue: messages waiting for their turn ----------
+// A message the owner sends while the agent is busy waits in the queue (in the database, so a restart does not lose
+// it). The agent gets the messages one at a time and in order: each one when it finishes its current reply, in the
+// same session; whatever still waits when the run is over starts the next run. A message that starts a new
+// conversation waits until the current run is over. After Stop, a failed run or a restart, waiting messages are
+// held: they stay in the queue, but are only sent when the owner says so.
+
+export const HELD_STOPPED = 'Not sent, because you pressed Stop.';
+export const HELD_FAILED = 'Not sent, because the session before it ended with a problem.';
+export const HELD_RESTART = 'Not sent, because the app was closed before it was its turn.';
+
+const queueRows = db.prepare('SELECT * FROM chat_queue WHERE project_id = ? ORDER BY id');
+const firstWaiting = db.prepare('SELECT * FROM chat_queue WHERE project_id = ? AND held_reason IS NULL ORDER BY id LIMIT 1');
+const deleteQueued = db.prepare('DELETE FROM chat_queue WHERE id = ?');
+const queueItem = (r) => ({ id: r.id, text: r.text, at: r.created_at, new_conversation: Boolean(r.new_conversation), held_reason: r.held_reason ?? null });
+const queueChanged = (projectId, extra = {}) => emit('chat-queued', { projectId: Number(projectId), ...extra });
+
+export function queuedMessages(projectId) {
+  return queueRows.all(Number(projectId)).map(queueItem);
+}
+
+/**
+ * Puts a message at the end of the queue. `newConversation`: it starts a new conversation. Messages for that new
+ * chat written before it has started continue it, instead of starting yet another one.
+ */
+export function queueMessage(projectId, text, { newConversation = false } = {}) {
+  projectId = Number(projectId);
+  const startsNew =
+    newConversation && !db.prepare('SELECT 1 FROM chat_queue WHERE project_id = ? AND new_conversation = 1 AND held_reason IS NULL').get(projectId);
+  const res = db
+    .prepare('INSERT INTO chat_queue(project_id, text, created_at, new_conversation) VALUES (?, ?, ?, ?)')
+    .run(projectId, String(text), now(), startsNew ? 1 : 0);
+  queueChanged(projectId);
+  return queueItem(db.prepare('SELECT * FROM chat_queue WHERE id = ?').get(Number(res.lastInsertRowid)));
+}
+
+/** The next waiting message, for the agent's pause; null when there is none or it must start a new conversation. */
+function takeForPause(projectId) {
+  const next = firstWaiting.get(projectId);
+  if (!next || next.new_conversation) return null;
+  deleteQueued.run(next.id);
+  queueChanged(projectId);
+  return next;
+}
+
+/** Holds the waiting messages (or the one with `id`). */
+function holdQueued(projectId, reason, id = null) {
+  const res = id
+    ? db.prepare('UPDATE chat_queue SET held_reason = ? WHERE id = ? AND held_reason IS NULL').run(reason, id)
+    : db.prepare('UPDATE chat_queue SET held_reason = ? WHERE project_id = ? AND held_reason IS NULL').run(reason, projectId);
+  if (res.changes) queueChanged(projectId);
+}
+
+/** Starts a run with the first waiting message if the agent is free. Returns the run, or null. */
+export function sendNextQueued(projectId) {
+  projectId = Number(projectId);
+  if (active.has(projectId)) return null;
+  const next = firstWaiting.get(projectId);
+  if (!next) return null;
+  let r;
+  try {
+    r = startRun(projectId, 'chat', { message: next.text, newConversation: Boolean(next.new_conversation) });
+  } catch (err) {
+    holdQueued(projectId, `Not sent: ${err.message}`, next.id);
+    return null;
+  }
+  if (r.status === 'skipped') {
+    holdQueued(projectId, `Not sent: ${r.reason.replace(/^skipped: /, '')}.`, next.id);
+    return null;
+  }
+  deleteQueued.run(next.id);
+  queueChanged(projectId, { started: { id: next.id, runId: r.runId, conversationId: r.conversationId, newConversation: Boolean(next.new_conversation) } });
+  return r;
+}
+
+/**
+ * A message from the owner: it starts the agent when the agent is free and nothing else waits, otherwise it joins
+ * the queue. Returns the started run ({ runId, conversationId, status }) or { queued: true, item }.
+ */
+export function sendMessage(projectId, text, { newConversation = false } = {}) {
+  projectId = Number(projectId);
+  if (active.has(projectId) || firstWaiting.get(projectId)) {
+    const item = queueMessage(projectId, text, { newConversation });
+    sendNextQueued(projectId);
+    return { queued: true, item };
+  }
+  return startRun(projectId, 'chat', { message: String(text), newConversation });
+}
+
+/** "Send" for held messages (one, or all of them): they wait for their turn again; the agent starts if it is free. */
+export function releaseQueued(projectId, id = null) {
+  projectId = Number(projectId);
+  const res = id
+    ? db.prepare('UPDATE chat_queue SET held_reason = NULL WHERE project_id = ? AND id = ? AND held_reason IS NOT NULL').run(projectId, Number(id))
+    : db.prepare('UPDATE chat_queue SET held_reason = NULL WHERE project_id = ? AND held_reason IS NOT NULL').run(projectId);
+  if (!res.changes) return false;
+  queueChanged(projectId);
+  sendNextQueued(projectId);
+  return true;
+}
+
+export function removeQueued(projectId, id) {
+  const res = db.prepare('DELETE FROM chat_queue WHERE project_id = ? AND id = ?').run(Number(projectId), Number(id));
+  if (res.changes) queueChanged(projectId);
+  return res.changes > 0;
+}
+
+export function clearQueue(projectId) {
+  const res = db.prepare('DELETE FROM chat_queue WHERE project_id = ?').run(Number(projectId));
+  if (res.changes) queueChanged(projectId);
+}
+
+/** After a restart nothing is sent by itself: messages that were still waiting are held. */
+export function holdQueueAfterRestart() {
+  db.prepare('UPDATE chat_queue SET held_reason = ? WHERE held_reason IS NULL').run(HELD_RESTART);
+}
+
+// ---------- Starting and stopping ----------
 
 const insertRun = db.prepare('INSERT INTO runs(project_id, trigger, started_at, status, ended_at, error, agent) VALUES (?, ?, ?, ?, ?, ?, ?)');
 const insertLog = db.prepare('INSERT INTO run_logs(run_id, seq, ts, type, content) VALUES (?, ?, ?, ?, ?)');
@@ -47,52 +174,6 @@ function capReached(project) {
   return budgetPaused() || (cap > 0 && monthCost() >= cap);
 }
 
-/** Starts a run unless one is already active for the project. Returns immediately. */
-export function startRun(projectId, trigger = 'manual') {
-  projectId = Number(projectId);
-  const project = getProject(projectId);
-  if (!project) throw new Error('Project not found');
-
-  if (active.has(projectId)) return recordSkipped(project, trigger, 'skipped: previous run still active');
-  if (capReached(project)) return recordSkipped(project, trigger, 'skipped: monthly budget cap reached');
-
-  const res = insertRun.run(projectId, trigger, now(), 'running', null, null, project.agent);
-  const runId = Number(res.lastInsertRowid);
-  const ctx = {
-    runId,
-    abort: new AbortController(),
-    stopReason: null,
-    conversation: null,
-    hardStopTimer: null,
-    requestStop(reason) {
-      if (this.stopReason) return;
-      this.stopReason = reason;
-      this.conversation?.interrupt();
-      this.hardStopTimer = setTimeout(() => this.abort.abort(), HARD_STOP_MS);
-    },
-  };
-  active.set(projectId, ctx);
-  emit('run-updated', { projectId, runId, status: 'running' });
-  console.log(`Run #${runId} started for project "${project.name}" (${AGENTS[project.agent].label}, ${trigger}).`);
-
-  executeRun(project, runId, ctx).catch((err) => console.error(`Run ${runId} crashed:`, err));
-  return { runId, status: 'running' };
-}
-
-export function stopRun(projectId) {
-  const ctx = active.get(Number(projectId));
-  if (!ctx) return false;
-  ctx.requestStop('stopped');
-  return true;
-}
-
-/** Stops every active run and resolves once all of them have been recorded (or after the timeout). */
-export async function stopAllRuns(timeoutMs = 30_000) {
-  for (const ctx of active.values()) ctx.requestStop('stopped');
-  const deadline = Date.now() + timeoutMs;
-  while (active.size && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
-}
-
 /** Why the next run should start a fresh session instead of continuing the previous one (or null). */
 export function freshSessionReason(project, limits = effectiveLimits(project)) {
   if (!project.session_id) return 'no previous session';
@@ -110,10 +191,87 @@ export function freshSessionReason(project, limits = effectiveLimits(project)) {
   return null;
 }
 
+/**
+ * The conversation a new run belongs to: the current one when the agent session continues, a new one (named
+ * after this run) when it starts fresh. A fresh start whose previous attempt never got a session (for example
+ * because Kimi was logged out) stays in that conversation, so retries do not leave a trail of empty ones.
+ */
+function pickConversation(project, runId, freshReason, forceNew) {
+  const current = project.conversation_id;
+  if (!current || forceNew) return runId;
+  if (!freshReason) return current;
+  const started = db.prepare('SELECT 1 FROM runs WHERE conversation_id = ? AND session_id IS NOT NULL LIMIT 1').get(current);
+  return started ? runId : current;
+}
+
+/**
+ * Starts a run unless one is already active for the project. Returns immediately.
+ * `message` (chat): the owner's message for the agent. `newConversation`: start a new conversation with it.
+ */
+export function startRun(projectId, trigger = 'manual', { message = null, newConversation = false } = {}) {
+  projectId = Number(projectId);
+  let project = getProject(projectId);
+  if (!project) throw new Error('Project not found');
+
+  if (active.has(projectId)) return recordSkipped(project, trigger, 'skipped: previous run still active');
+  if (capReached(project)) return recordSkipped(project, trigger, 'skipped: monthly budget cap reached');
+
+  if (newConversation && !project.fresh_pending) {
+    setProjectFields(projectId, { fresh_pending: 1 });
+    project = getProject(projectId);
+  }
+  const freshReason = freshSessionReason(project);
+  const res = insertRun.run(projectId, trigger, now(), 'running', null, null, project.agent);
+  const runId = Number(res.lastInsertRowid);
+  const conversationId = pickConversation(project, runId, freshReason, newConversation);
+  db.prepare('UPDATE runs SET conversation_id = ?, user_message = ? WHERE id = ?').run(conversationId, message ? String(message) : null, runId);
+  if (project.conversation_id !== conversationId) setProjectFields(projectId, { conversation_id: conversationId });
+
+  const ctx = {
+    runId,
+    conversationId,
+    freshReason,
+    message: message ? String(message) : null,
+    abort: new AbortController(),
+    stopReason: null,
+    conversation: null,
+    hardStopTimer: null,
+    requestStop(reason) {
+      if (this.stopReason) return;
+      this.stopReason = reason;
+      this.conversation?.interrupt();
+      this.hardStopTimer = setTimeout(() => this.abort.abort(), HARD_STOP_MS);
+    },
+  };
+  active.set(projectId, ctx);
+  emit('run-updated', { projectId, runId, conversationId, status: 'running' });
+  console.log(`Run #${runId} started for project "${project.name}" (${AGENTS[project.agent].label}, ${trigger}).`);
+
+  executeRun(project, runId, ctx).catch((err) => console.error(`Run ${runId} crashed:`, err));
+  return { runId, conversationId, status: 'running' };
+}
+
+export function stopRun(projectId) {
+  const ctx = active.get(Number(projectId));
+  if (!ctx) return false;
+  ctx.requestStop('stopped');
+  return true;
+}
+
+/** Stops every active run (the app is closing) and resolves once all of them have been recorded (or after the timeout). */
+export async function stopAllRuns(timeoutMs = 30_000) {
+  for (const ctx of active.values()) ctx.requestStop('shutdown');
+  const deadline = Date.now() + timeoutMs;
+  while (active.size && Date.now() < deadline) await new Promise((r) => setTimeout(r, 200));
+}
+
+// ---------- One run ----------
+
 async function executeRun(project, runId, ctx) {
   const projectId = project.id;
   const agent = AGENTS[project.agent];
   const limits = effectiveLimits(project);
+  const chat = Boolean(ctx.message);
   const startedMs = Date.now();
   let seq = 0;
   const log = (type, content) => {
@@ -121,6 +279,7 @@ async function executeRun(project, runId, ctx) {
     insertLog.run(runId, entry.seq, entry.ts, type, entry.content);
     emit('log', entry);
   };
+  if (chat) log('user', ctx.message);
 
   let status = 'failed';
   let error = null;
@@ -140,6 +299,17 @@ async function executeRun(project, runId, ctx) {
   const progressWritten = () => {
     const after = progressContent();
     return memoryWritten.has('/memories/progress.md') && after !== progressBefore && after.length > progressBefore.length;
+  };
+  const changesSoFar = () => {
+    try {
+      return before ? diffFingerprints(before, fingerprintFolder(project.folder)) : null;
+    } catch {
+      return null;
+    }
+  };
+  const filesChanged = () => {
+    const c = changesSoFar();
+    return Boolean(c && c.added.length + c.changed.length + c.removed.length);
   };
 
   try {
@@ -166,7 +336,7 @@ async function executeRun(project, runId, ctx) {
     before = fingerprintFolder(project.folder);
 
     const fresh = getProject(projectId);
-    const freshReason = freshSessionReason(fresh, limits);
+    const freshReason = ctx.freshReason;
     const resumeId = freshReason ? null : fresh.session_id;
     const baseline = resumeId ? fresh.session_cost_total || 0 : 0;
     sessionMode = resumeId ? 'resumed' : 'fresh';
@@ -174,25 +344,47 @@ async function executeRun(project, runId, ctx) {
       ? `Continuing the previous ${agent.label} session (run ${fresh.runs_on_session + 1} on this session).`
       : `Starting a fresh ${agent.label} session (${freshReason}). The agent relies on its memory.`);
 
-    // Claude gets the standing rules through its system prompt; Kimi has no such channel, so they lead the prompt.
-    const prompt = project.agent === 'kimi' ? `${SYSTEM_APPEND.trim()}\n${KIMI_RULES}\n\n${buildPrompt(fresh)}` : buildPrompt(fresh);
+    // Claude gets the standing rules through its system prompt; Kimi has no such channel, so they lead the
+    // first prompt of a session (and every scheduled prompt, as before).
+    const systemAppend = chat ? CHAT_SYSTEM_APPEND : SYSTEM_APPEND;
+    const kimiRules = `${systemAppend.trim()}\n${KIMI_RULES}\n\n`;
+    const freshBody = chat ? buildChatPrompt(fresh, ctx.message) : buildPrompt(fresh);
+    const freshPrompt = project.agent === 'kimi' ? kimiRules + freshBody : freshBody;
+    let prompt = freshPrompt;
+    if (resumeId && chat) prompt = chatTurnPrompt(fresh, ctx.message);
+    else if (resumeId) prompt = project.agent === 'kimi' ? kimiRules + buildPrompt(fresh) : buildPrompt(fresh);
     log('prompt', prompt);
 
     let followUpSent = false;
+    // Between turns: first hand over messages the owner typed meanwhile, then make sure progress was recorded.
     const onTurnEnd = () => {
-      if (ctx.stopReason || followUpSent || progressWritten()) return null;
+      if (ctx.stopReason) return null;
+      const queued = takeForPause(projectId);
+      if (queued) {
+        log('user', queued.text);
+        return { text: chatTurnPrompt(getProject(projectId) ?? project, queued.text), limited: true };
+      }
+      if (followUpSent || progressWritten()) return null;
+      if (chat && !filesChanged()) return null; // a question that changed nothing needs no progress note
       followUpSent = true;
       log('warning', 'The agent finished without writing a progress entry. Asking it to write one now.');
-      return progressFollowUp(sessionStamp(project.timezone));
+      return { text: progressFollowUp(sessionStamp(project.timezone)), limited: false };
     };
 
     const r = await ADAPTERS[project.agent]({
-      ctx, projectId, folder: project.folder, limits, prompt, resumeId, runId, log, memoryWritten, onTurnEnd,
+      ctx, projectId, folder: project.folder, limits, prompt, freshPrompt, resumeId, runId, log, memoryWritten, onTurnEnd, systemAppend,
     });
     sessionId = r.sessionId;
     turns = r.turns;
     model = r.model ?? model;
-    if (resumeId && !r.resumed) sessionMode = 'fresh (resume failed)';
+    if (resumeId && !r.resumed) {
+      sessionMode = 'fresh (resume failed)';
+      // The old session could not be continued, so this run starts a new conversation.
+      ctx.conversationId = runId;
+      db.prepare('UPDATE runs SET conversation_id = ? WHERE id = ?').run(runId, runId);
+      setProjectFields(projectId, { conversation_id: runId });
+      emit('run-updated', { projectId, runId, conversationId: runId, status: 'running' });
+    }
 
     if (agent.billing === 'api') {
       lastTotalCost = r.costTotal;
@@ -208,7 +400,7 @@ async function executeRun(project, runId, ctx) {
       throw new RunError(r.error);
     } else if (main === 'success') {
       summary = r.summary;
-      if (progressWritten()) {
+      if (progressWritten() || chat) {
         status = 'success';
       } else {
         status = 'failed';
@@ -228,29 +420,26 @@ async function executeRun(project, runId, ctx) {
   } finally {
     clearTimeout(timer);
     clearTimeout(ctx.hardStopTimer);
-    if (ctx.stopReason === 'stopped') {
+    if (ctx.stopReason === 'stopped' || ctx.stopReason === 'shutdown') {
       status = 'stopped';
-      error = 'Stopped by the owner.';
+      error = ctx.stopReason === 'stopped' ? 'Stopped by the owner.' : 'Stopped because the app was closed.';
     } else if (ctx.stopReason === 'timeout') {
       status = 'limit_reached';
       error = `Time limit reached (${limits.maxMinutes} minutes).`;
     }
 
-    let changedFiles = null;
-    if (before) {
-      try {
-        changedFiles = diffFingerprints(before, fingerprintFolder(project.folder));
-      } catch {
-        /* folder gone */
-      }
-    }
+    const changedFiles = changesSoFar();
+    const anyChange = Boolean(changedFiles && changedFiles.added.length + changedFiles.changed.length + changedFiles.removed.length);
 
     let agentNote = null;
     try {
-      if (status !== 'success' && turns > 0 && !progressWritten()) {
-        agentNote = `## ${sessionStamp(project.timezone)} — Session ended early (run #${runId}, ${status.replace('_', ' ')})\n` +
-          `- Done: not recorded by the agent. See run #${runId} in the app for the full log.\n` +
-          `- Problem: ${(error ?? 'unknown').split('\n')[0]}\n` +
+      // Scheduled sessions must leave a note; chat sessions only when they changed files.
+      const needsNote = chat ? anyChange : status !== 'success';
+      if (needsNote && turns > 0 && !progressWritten()) {
+        const what = status === 'success' ? 'Chat session changed files' : `Session ended early (run #${runId}, ${status.replace('_', ' ')})`;
+        agentNote = `## ${sessionStamp(project.timezone)} — ${what}\n` +
+          `- Done: not recorded by the agent. See run #${runId} in the app for the full conversation.\n` +
+          (status === 'success' ? `- Files changed: ${[...changedFiles.added, ...changedFiles.changed, ...changedFiles.removed].slice(0, 12).join(', ')}\n` : `- Problem: ${(error ?? 'unknown').split('\n')[0]}\n`) +
           `- Next step: check the project folder against the plan, then continue the step that was in progress.\n`;
         const current = progressContent();
         memoryStore(projectId, { changedBy: 'app', onWrite: (p) => memoryWritten.add(p) }).save('/memories/progress.md', `${current.replace(/\s*$/, '')}\n\n${agentNote}`);
@@ -266,7 +455,7 @@ async function executeRun(project, runId, ctx) {
       const steps = parsePlan(getEntry(projectId, '/memories/plan.md')?.content);
       planFinished = steps.length > 0 && steps.every((s) => s.status === 'done');
       if (planFinished && getProject(projectId)?.enabled) {
-        log('system', 'Every step of the plan is done, so the schedule was paused. Add new steps to the plan and resume the schedule when you want more work done.');
+        log('system', 'Every step of the plan is done, so the schedule was paused. Add new steps to the plan (or just ask in the chat) and turn the schedule on again under Scheduled tasks when you want more scheduled work.');
       }
     }
 
@@ -299,7 +488,7 @@ async function executeRun(project, runId, ctx) {
         fields.consecutive_failures = 0;
         if (planFinished && latest.enabled) {
           fields.enabled = 0;
-          fields.paused_reason = 'All plan steps are done, so the schedule was paused. Add new steps to the plan, then press "Resume schedule".';
+          fields.paused_reason = PLAN_DONE_NOTE;
         }
       }
       setProjectFields(projectId, fields);
@@ -314,8 +503,24 @@ async function executeRun(project, runId, ctx) {
       setSetting('budget_paused_month', currentMonthKey());
       emit('budget-paused', { cap });
     }
-    emit('run-updated', { projectId, runId, status });
+    emit('run-updated', { projectId, runId, conversationId: ctx.conversationId, status });
     emit('projects-changed', {});
+
+    // Messages still waiting start the next run. After Stop, a failure or when the app closes they are held instead.
+    if (firstWaiting.get(projectId)) {
+      if (ctx.stopReason === 'stopped') holdQueued(projectId, HELD_STOPPED);
+      else if (ctx.stopReason === 'shutdown') holdQueued(projectId, HELD_RESTART);
+      else if (status === 'failed') holdQueued(projectId, HELD_FAILED);
+      else {
+        setTimeout(() => {
+          try {
+            sendNextQueued(projectId);
+          } catch (err) {
+            console.error(`The next queued message for project ${projectId} could not be sent:`, err.message);
+          }
+        }, 300);
+      }
+    }
   }
 }
 

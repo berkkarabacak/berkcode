@@ -9,9 +9,12 @@ export function describeToolUse(name, input = {}) {
   if (name === `mcp__${MEMORY_SERVER}__memory`) {
     const target = input.command === 'rename' ? `${input.old_path} → ${input.new_path}` : input.path ?? '/memories';
     let detail = '';
-    if (input.command === 'create') detail = `\n${clip(input.file_text, 600)}`;
-    if (input.command === 'str_replace') detail = `\n- ${clip(input.old_str, 300)}\n+ ${clip(input.new_str, 300)}`;
-    if (input.command === 'insert') detail = ` (after line ${input.insert_line})\n${clip(input.insert_text, 600)}`;
+    // Some agents announce a call before all of its input is known: show only what is there.
+    if (input.command === 'create' && input.file_text != null) detail = `\n${clip(input.file_text, 600)}`;
+    if (input.command === 'str_replace' && input.old_str != null) detail = `\n- ${clip(input.old_str, 300)}\n+ ${clip(input.new_str ?? '', 300)}`;
+    if (input.command === 'insert') {
+      detail = `${input.insert_line != null ? ` (after line ${input.insert_line})` : ''}${input.insert_text != null ? `\n${clip(input.insert_text, 600)}` : ''}`;
+    }
     return { type: 'memory', content: `Memory ${input.command}: ${target}${detail}` };
   }
   if (name === `mcp__${MEMORY_SERVER}__memory_search`) return { type: 'memory', content: `Memory search: "${input.query}"` };

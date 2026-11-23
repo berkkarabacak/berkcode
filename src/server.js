@@ -15,7 +15,11 @@ import {
   listEntries, getEntry, memoryStore, searchMemory, entryHistory, historyVersion, ensureStandardEntries,
   exportMemory, importMemory, normalizePath, MemoryError,
 } from './memory.js';
-import { startRun, stopRun, stopAllRuns, activeRunId, recoverInterruptedRuns, freshSessionReason } from './runner.js';
+import {
+  startRun, stopRun, stopAllRuns, activeRunId, activeConversationId, recoverInterruptedRuns, freshSessionReason,
+  sendMessage, queuedMessages, clearQueue, removeQueued, releaseQueued, holdQueueAfterRestart, MAX_MESSAGE_LENGTH,
+} from './runner.js';
+import { listConversations, conversationRuns, conversationTitle } from './conversations.js';
 import { startScheduler, refreshSchedule, removeSchedule, previewSchedule, nextRunFor, describeSchedule, scheduleToCron } from './scheduler.js';
 import { isGitRepo, restoreFolder, restorePointAvailable } from './restorePoints.js';
 import { testKey, listModels, pickDefaultModel } from './anthropicApi.js';
@@ -109,6 +113,8 @@ function projectSummary(p) {
     last_run: last ? { id: last.id, status: last.status, started_at: last.started_at, cost_usd: last.cost_usd, model: last.model } : null,
     month_cost: monthCost(p.id),
     active_run_id: activeRunId(p.id),
+    active_conversation_id: activeConversationId(p.id),
+    queued: queuedMessages(p.id),
     limits: effectiveLimits(p),
     next_fresh_reason: freshSessionReason(p),
     folder_exists: folderExists,
@@ -396,8 +402,8 @@ app.delete('/api/projects/:id', wrap((req) => {
   emit('projects-changed', {});
 }));
 
-app.post('/api/projects/:id/run', wrap(async (req) => {
-  const p = requireProject(req.params.id);
+/** Fails with a plain message when the project's agent cannot work right now. */
+async function ensureAgentReady(p) {
   if (p.agent === 'claude' && !getSetting('api_key')) throw httpError(400, 'No Claude API key is set yet. Open Settings and enter your API key first.');
   if (p.agent === 'kimi') {
     const kimi = await kimiStatus();
@@ -407,7 +413,73 @@ app.post('/api/projects/:id/run', wrap(async (req) => {
       if (!fresh.loggedIn) throw httpError(400, fresh.message);
     }
   }
+}
+
+app.post('/api/projects/:id/run', wrap(async (req) => {
+  const p = requireProject(req.params.id);
+  await ensureAgentReady(p);
   return startRun(p.id, 'manual');
+}));
+
+/**
+ * A message from the owner in the chat. It starts the agent in the project's current conversation (or a new
+ * conversation), or, while the agent is busy, it waits in the queue for its turn.
+ */
+app.post('/api/projects/:id/chat', wrap(async (req) => {
+  const p = requireProject(req.params.id);
+  const message = String(req.body?.message ?? '').trim();
+  if (!message) throw httpError(400, 'Write a message first.');
+  if (message.length > MAX_MESSAGE_LENGTH) throw httpError(400, `The message is too long (${message.length} characters, the limit is ${MAX_MESSAGE_LENGTH}).`);
+  // Starting the agent needs it to be ready; a message that only joins the queue does not.
+  if (!activeRunId(p.id)) await ensureAgentReady(p);
+  const r = sendMessage(p.id, message, { newConversation: Boolean(req.body?.new_conversation) });
+  if (r.status === 'skipped') throw httpError(409, `The message was not sent: ${r.reason.replace(/^skipped: /, '')}.`);
+  return r;
+}));
+
+/** Removes every message from the queue. */
+app.delete('/api/projects/:id/queue', wrap((req) => {
+  const p = requireProject(req.params.id);
+  clearQueue(p.id);
+}));
+
+/** Removes one message from the queue ("Remove", and "Edit", which takes it back into the message box). */
+app.delete('/api/projects/:id/queue/:qid', wrap((req) => {
+  const p = requireProject(req.params.id);
+  if (!removeQueued(p.id, req.params.qid)) throw httpError(404, 'This message is no longer in the queue: the agent already has it.');
+}));
+
+/** "Send" for held messages: all of them, or one. */
+app.post('/api/projects/:id/queue/send', wrap(async (req) => {
+  const p = requireProject(req.params.id);
+  if (!activeRunId(p.id)) await ensureAgentReady(p);
+  if (!releaseQueued(p.id)) throw httpError(404, 'There are no held messages to send.');
+}));
+
+app.post('/api/projects/:id/queue/:qid/send', wrap(async (req) => {
+  const p = requireProject(req.params.id);
+  if (!activeRunId(p.id)) await ensureAgentReady(p);
+  if (!releaseQueued(p.id, req.params.qid)) throw httpError(404, 'This message is no longer held: it was sent or removed.');
+}));
+
+app.get('/api/projects/:id/conversations', wrap((req) => {
+  const p = requireProject(req.params.id);
+  return listConversations(p.id, activeConversationId(p.id));
+}));
+
+app.get('/api/projects/:id/conversations/:cid', wrap((req) => {
+  const p = requireProject(req.params.id);
+  const cid = Number(req.params.cid);
+  const { runs, earlier } = conversationRuns(p.id, cid, { before: Number(req.query.before) || null });
+  if (!runs.length && !req.query.before) throw httpError(404, 'This conversation was not found.');
+  const logsFor = db.prepare('SELECT seq, ts, type, content FROM run_logs WHERE run_id = ? ORDER BY seq');
+  return {
+    id: cid,
+    title: conversationTitle(cid),
+    earlier,
+    current: p.conversation_id === cid,
+    runs: runs.map((r) => ({ ...runRow(r), logs: logsFor.all(r.id) })),
+  };
 }));
 
 app.post('/api/projects/:id/stop', wrap((req) => {
@@ -721,6 +793,7 @@ try {
 }
 
 recoverInterruptedRuns();
+holdQueueAfterRestart();
 startScheduler();
 const dailyBackup = () => {
   try {

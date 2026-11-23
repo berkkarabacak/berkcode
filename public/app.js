@@ -1,122 +1,13 @@
-// Claude Agent Runner – browser UI (plain JavaScript, no build step)
+// Claude Agent Runner – browser UI (plain JavaScript, no build step).
+// Laid out like Claude Code: projects and their conversations in the sidebar, the selected conversation (or
+// page) on the right. The chat lives in js/chat.js, shared helpers in js/util.js.
+import {
+  $, $$, esc, md, state, api, toast, attempt, fmtTime, fmtCost, fmtDuration, timeAgo, shortAgo,
+  agentBadge, agentLabel, runCost, statusChip, modal, confirmModal, icon,
+} from './js/util.js';
+import { renderChat, closeChat, chatOnLog, chatOnRunUpdated, chatProjectUpdated, chatOnQueue } from './js/chat.js';
 
-const $ = (sel, root = document) => root.querySelector(sel);
-const $$ = (sel, root = document) => [...root.querySelectorAll(sel)];
 const view = $('#view');
-
-const esc = (s) =>
-  String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
-
-if (window.marked) {
-  window.marked.use({ renderer: { html: (token) => esc(token.text ?? token.raw ?? '') } });
-}
-const md = (s) => (window.marked ? window.marked.parse(String(s ?? '')) : `<pre>${esc(s)}</pre>`);
-
-const state = {
-  settings: null,
-  budgetPaused: false,
-  monthCost: 0,
-  route: null,
-  project: null,
-  models: null,
-  memory: null,
-  memorySection: 'brief',
-  editing: false,
-  live: null, // { runId, lastSeq, buffer, container }
-};
-
-// ---------------- utilities ----------------
-
-async function api(method, url, body) {
-  const res = await fetch(url, {
-    method,
-    headers: body !== undefined ? { 'Content-Type': 'application/json' } : {},
-    body: body !== undefined ? JSON.stringify(body) : undefined,
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) throw new Error(data.error || `Request failed (${res.status})`);
-  return data;
-}
-
-function toast(message, kind = '') {
-  const el = document.createElement('div');
-  el.className = `toast ${kind}`;
-  el.textContent = message;
-  $('#toast-root').append(el);
-  setTimeout(() => el.remove(), kind === 'error' ? 7000 : 3500);
-}
-
-async function attempt(fn, success) {
-  try {
-    const r = await fn();
-    if (success) toast(success);
-    return r;
-  } catch (err) {
-    toast(err.message, 'error');
-    return undefined;
-  }
-}
-
-const fmtTime = (iso, tz) => {
-  if (!iso) return '—';
-  const opts = { weekday: 'short', day: 'numeric', month: 'short', hour: '2-digit', minute: '2-digit' };
-  if (tz) opts.timeZone = tz;
-  try {
-    return new Date(iso).toLocaleString(undefined, opts);
-  } catch {
-    return new Date(iso).toLocaleString();
-  }
-};
-const fmtCost = (v) => (v == null ? '—' : `$${Number(v).toFixed(v < 1 ? 3 : 2)}`);
-const fmtDuration = (ms) => {
-  if (ms == null) return '—';
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  if (m < 60) return `${m}m ${s % 60}s`;
-  return `${Math.floor(m / 60)}h ${m % 60}m`;
-};
-const agentBadge = (agent) => `<span class="agent-badge ${agent === 'kimi' ? 'kimi' : 'claude'}">${agent === 'kimi' ? 'Kimi' : 'Claude'}</span>`;
-/** Kimi runs are covered by the subscription, so they show no dollar cost. */
-const runCost = (agent, value) => (agent === 'kimi' ? 'Subscription' : fmtCost(value));
-const statusChip = (s) => `<span class="status ${esc(s)}">${esc(String(s).replace('_', ' '))}</span>`;
-const timeAgo = (iso) => {
-  if (!iso) return '';
-  const diff = (Date.now() - new Date(iso).getTime()) / 1000;
-  if (diff < 60) return 'just now';
-  if (diff < 3600) return `${Math.round(diff / 60)} min ago`;
-  if (diff < 86400) return `${Math.round(diff / 3600)} h ago`;
-  return `${Math.round(diff / 86400)} days ago`;
-};
-
-function modal(html, onMount) {
-  const root = $('#modal-root');
-  root.innerHTML = `<div class="modal-backdrop"><div class="modal">${html}</div></div>`;
-  const close = () => (root.innerHTML = '');
-  $('.modal-backdrop', root).addEventListener('click', (e) => {
-    if (e.target.classList.contains('modal-backdrop')) close();
-  });
-  $$('[data-close]', root).forEach((b) => b.addEventListener('click', close));
-  onMount?.($('.modal', root), close);
-  return close;
-}
-
-function confirmModal(title, message, confirmLabel = 'Confirm', danger = true, cancelLabel = 'Cancel') {
-  return new Promise((resolve) => {
-    modal(
-      `<h2>${esc(title)}</h2><p>${message}</p>
-       <div class="row" style="justify-content:flex-end"><button data-close>${esc(cancelLabel)}</button>
-       <button class="${danger ? 'danger' : 'primary'}" id="confirm-yes">${esc(confirmLabel)}</button></div>`,
-      (el, close) => {
-        $('[data-close]', el).addEventListener('click', () => resolve(false));
-        $('#confirm-yes', el).addEventListener('click', () => {
-          close();
-          resolve(true);
-        });
-      }
-    );
-  });
-}
 
 async function loadModels() {
   if (!state.models) state.models = await api('GET', '/api/models').catch(() => ({ models: [] }));
@@ -248,23 +139,112 @@ async function offerStartWithWindows() {
   );
   if (yes && (await attempt(() => api('PUT', '/api/settings', { start_with_windows: true }), 'The app will now start by itself when you log in to Windows.'))) {
     await refreshState();
-    if (state.route?.name === 'dashboard') renderDashboard();
+    if (state.route?.name === 'schedules') renderSchedules();
   }
 }
 
-function setNav(name) {
-  $$('[data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === name));
+// ---------------- sidebar: projects and their conversations ----------------
+
+const sidebar = {
+  conversations: new Map(), // projectId -> conversations, newest first
+  collapsed: new Set(JSON.parse(localStorage.getItem('collapsedProjects') || '[]')),
+  showAll: new Set(),
+};
+const SIDEBAR_CHATS = 6;
+
+/** Loads the projects and the conversations of the expanded ones, then redraws the sidebar. */
+async function refreshSidebar() {
+  const projects = await api('GET', '/api/projects');
+  state.projects = projects;
+  await Promise.all(
+    projects
+      .filter((p) => !sidebar.collapsed.has(p.id))
+      .map(async (p) => sidebar.conversations.set(p.id, await api('GET', `/api/projects/${p.id}/conversations`).catch(() => [])))
+  );
+  renderSidebar();
+  if (state.route?.name === 'project') renderProjectHeader();
+}
+
+let sidebarTimer = null;
+function refreshSidebarSoon() {
+  clearTimeout(sidebarTimer);
+  sidebarTimer = setTimeout(() => refreshSidebar().catch(() => {}), 250);
+}
+
+const needsAttention = (p) => !p.folder_exists || (!p.enabled && p.consecutive_failures >= 3 && p.paused_reason);
+
+function renderSidebar() {
+  const r = state.route ?? {};
+  const box = $('#side-projects');
+  box.innerHTML = state.projects.length
+    ? state.projects.map((p) => projectGroupHtml(p, r)).join('')
+    : '<div class="side-empty">No projects yet.</div>';
+  $$('[data-toggle-project]', box).forEach((b) =>
+    b.addEventListener('click', () => {
+      const id = Number(b.dataset.toggleProject);
+      if (sidebar.collapsed.has(id)) sidebar.collapsed.delete(id);
+      else sidebar.collapsed.add(id);
+      localStorage.setItem('collapsedProjects', JSON.stringify([...sidebar.collapsed]));
+      renderSidebar();
+      if (!sidebar.collapsed.has(id)) refreshSidebar().catch(() => {});
+    })
+  );
+  $$('[data-more]', box).forEach((b) =>
+    b.addEventListener('click', () => {
+      const id = Number(b.dataset.more);
+      if (sidebar.showAll.has(id)) sidebar.showAll.delete(id);
+      else sidebar.showAll.add(id);
+      renderSidebar();
+    })
+  );
+  $$('.side-nav [data-nav]').forEach((a) => a.classList.toggle('active', a.dataset.nav === r.name));
+}
+
+function projectGroupHtml(p, r) {
+  const open = !sidebar.collapsed.has(p.id);
+  const here = r.name === 'project' && r.id === p.id;
+  const chats = sidebar.conversations.get(p.id) ?? [];
+  const shown = sidebar.showAll.has(p.id) ? chats : chats.slice(0, SIDEBAR_CHATS);
+  const dot = p.active_run_id
+    ? '<span class="side-dot working" title="Working now"></span>'
+    : needsAttention(p)
+      ? '<span class="side-dot attention" title="Needs your attention"></span>'
+      : '';
+  return `<div class="side-project ${open ? 'open' : ''} ${here ? 'here' : ''}">
+      <div class="side-project-head">
+        <button class="side-toggle" data-toggle-project="${p.id}" aria-label="${open ? 'Collapse' : 'Expand'} ${esc(p.name)}" aria-expanded="${open}">${icon('chevron', 14)}</button>
+        <a href="#/project/${p.id}" class="side-project-name" title="${esc(p.name)}">${esc(p.name)}</a>${dot}
+        <span class="side-agent ${p.agent}">${agentLabel(p.agent)}</span>
+      </div>
+      ${open ? `<div class="side-chats">
+        <a class="side-chat new ${here && r.chat === 'new' ? 'active' : ''}" href="#/project/${p.id}/chat/new">${icon('plus', 14)}<span>New chat</span></a>
+        ${shown.map((c) => `<a class="side-chat ${here && r.tab === 'chat' && r.chat === String(c.id) ? 'active' : ''}" href="#/project/${p.id}/chat/${c.id}" title="${esc(c.title)}">
+            <span class="side-chat-title">${c.running ? '<span class="side-dot working"></span>' : c.last_status === 'failed' ? '<span class="side-dot attention" title="Did not finish"></span>' : ''}${esc(c.title)}</span>
+            <span class="side-chat-when">${esc(shortAgo(c.last_active))}</span></a>`).join('')}
+        ${chats.length > SIDEBAR_CHATS ? `<button class="side-more" data-more="${p.id}">${sidebar.showAll.has(p.id) ? 'Show fewer' : `Show all ${chats.length}`}</button>` : ''}
+      </div>` : ''}
+    </div>`;
 }
 
 // ---------------- router ----------------
 
 function parseRoute() {
   const parts = location.hash.replace(/^#\/?/, '').split('/').filter(Boolean);
-  if (!parts.length) return { name: 'dashboard' };
+  if (!parts.length) return { name: 'home' };
   if (parts[0] === 'settings') return { name: 'settings' };
+  if (parts[0] === 'schedules') return { name: 'schedules' };
   if (parts[0] === 'new') return { name: 'new' };
-  if (parts[0] === 'project') return { name: 'project', id: Number(parts[1]), tab: parts[2] || 'runs', sub: parts[3] };
-  return { name: 'dashboard' };
+  if (parts[0] === 'project') {
+    const id = Number(parts[1]);
+    const tab = parts[2] || 'chat';
+    if (tab === 'chat') return { name: 'project', id, tab, chat: parts[3] ?? null, run: parts[4] === 'run' ? Number(parts[5]) : null };
+    // Links from earlier versions of the app.
+    if (tab === 'live') return { name: 'project', id, tab: 'chat', chat: null };
+    if (tab === 'runs' && parts[3]) return { name: 'project', id, tab: 'run-link', run: Number(parts[3]) };
+    if (tab === 'schedule') return { name: 'schedules' };
+    return { name: 'project', id, tab: ['memory', 'runs', 'setup'].includes(tab) ? tab : 'chat', chat: null };
+  }
+  return { name: 'home' };
 }
 
 let ignoreNextRoute = false;
@@ -289,89 +269,128 @@ async function router() {
   currentHash = location.hash;
   routeSeq++;
   state.editing = false;
-  state.live = null;
+  closeChat();
   state.route = parseRoute();
   const r = state.route;
-  setNav(r.name === 'settings' ? 'settings' : 'dashboard');
+  document.body.classList.remove('side-open');
+  renderSidebar();
+  view.className = r.name === 'project' ? 'view project-view' : 'view page-view';
   try {
-    if (r.name === 'dashboard') await renderDashboard();
+    if (r.name === 'home') await renderHome();
     else if (r.name === 'settings') await renderSettings();
+    else if (r.name === 'schedules') await renderSchedules();
     else if (r.name === 'new') await renderNewProject();
     else if (r.name === 'project') await renderProject();
   } catch (err) {
-    view.innerHTML = `<div class="panel"><h2>Something went wrong</h2><p>${esc(err.message)}</p><a href="#/">Back to projects</a></div>`;
+    view.className = 'view page-view';
+    view.innerHTML = `<div class="panel"><h2>Something went wrong</h2><p>${esc(err.message)}</p><a href="#/">Back to the start</a></div>`;
   }
 }
 
-// ---------------- dashboard ----------------
+// ---------------- home ----------------
 
-async function renderDashboard() {
+async function renderHome() {
   const stale = routeGuard();
-  const projects = await api('GET', '/api/projects');
-  if (stale() || parseRoute().name !== 'dashboard') return;
-  const cards = projects
-    .map((p) => {
-      const scheduleState = p.active_run_id ? statusChip('running') : p.enabled ? '<span class="status active">scheduled</span>' : '<span class="status paused">paused</span>';
-      return `<div class="card">
-        <div class="spread"><h3><a href="#/project/${p.id}">${esc(p.name)}</a> ${agentBadge(p.agent)}</h3>${scheduleState}</div>
-        <dl>
-          <dt>Schedule</dt><dd>${esc(p.schedule_text)}</dd>
-          <dt>Next run</dt><dd>${p.enabled ? (state.budgetPaused && p.billing === 'api' ? 'Paused (budget cap)' : esc(fmtTime(p.next_run, p.timezone))) : 'Paused'}</dd>
-          <dt>Last run</dt><dd>${p.last_run ? `${statusChip(p.last_run.status)} <span class="muted small">${esc(timeAgo(p.last_run.started_at))}</span>` : '<span class="muted">Never</span>'}</dd>
-          <dt>Last run cost</dt><dd>${p.last_run ? runCost(p.agent, p.last_run.cost_usd) : '—'}</dd>
-          <dt>This month</dt><dd>${runCost(p.agent, p.month_cost)}</dd>
-        </dl>
-        ${p.paused_reason ? `<div class="warn">${esc(p.paused_reason)}</div>` : ''}
-        ${p.folder_exists ? '' : `<div class="warn">The project folder was not found on this computer. Open the project and choose where its folder is in the Setup tab.</div>`}
-        <div class="row">
-          ${p.active_run_id ? `<button data-stop="${p.id}" class="danger">Stop run</button>` : `<button class="primary" data-run="${p.id}">Run now</button>`}
-          <button data-toggle="${p.id}" data-enabled="${p.enabled ? 1 : 0}">${p.enabled ? 'Pause schedule' : 'Resume schedule'}</button>
-          <a class="btn" href="#/project/${p.id}">Open</a>
-        </div>
-      </div>`;
-    })
-    .join('');
-
+  const projects = state.projects.length ? state.projects : await api('GET', '/api/projects');
+  if (stale()) return;
+  if (projects.length) {
+    // Continue where the work happens: the project that worked most recently.
+    const recent = [...projects].sort((a, b) => String(b.last_run?.started_at ?? '').localeCompare(String(a.last_run?.started_at ?? '')))[0];
+    location.replace(`#/project/${recent.id}`);
+    return;
+  }
   view.innerHTML = `
-    <div class="spread"><div><h1>Projects</h1><p class="muted">Spent this month across all projects: ${fmtCost(state.monthCost)} of ${fmtCost(state.settings?.monthly_cap_usd)} cap</p></div>
-      <a class="btn primary big" href="#/new">+ Add project</a></div>
-    ${projects.some((p) => p.enabled) && !state.settings?.start_with_windows ? `<div class="hint-box row" style="margin-bottom:16px;justify-content:space-between">
-      <span>Scheduled runs only happen while this app is running. Let it start by itself when you turn on the computer?</span>
-      <button class="small" id="enable-autostart">Yes, start with Windows</button></div>` : ''}
-    ${projects.length ? `<div class="cards">${cards}</div>` : `<div class="empty panel"><h2>No projects yet</h2><p>Add a project, describe what you want built, and the agent you choose (Claude or Kimi) will work on it step by step on your schedule.</p><a class="btn primary big" href="#/new">+ Add your first project</a></div>`}`;
-
-  $('#enable-autostart')?.addEventListener('click', async () => {
-    if (await attempt(() => api('PUT', '/api/settings', { start_with_windows: true }), 'The app will now start by itself when you log in to Windows.')) {
-      await refreshState();
-      renderDashboard();
-    }
-  });
-  $$('[data-run]').forEach((b) => b.addEventListener('click', () => runNow(b.dataset.run)));
-  $$('[data-stop]').forEach((b) => b.addEventListener('click', () => stopRunFor(b.dataset.stop)));
-  $$('[data-toggle]').forEach((b) =>
-    b.addEventListener('click', async () => {
-      const enabling = b.dataset.enabled !== '1';
-      const ok = await attempt(() => api('POST', `/api/projects/${b.dataset.toggle}/enabled`, { enabled: enabling }));
-      await renderDashboard();
-      if (ok && enabling) offerStartWithWindows();
-    })
-  );
+    <div class="welcome">
+      <div class="welcome-mark">${icon('spark', 30)}</div>
+      <h1>Welcome to Claude Agent Runner</h1>
+      <p class="muted">Describe a project in your own words, and an AI agent works on it step by step: when you chat with it, and on a schedule while you are away.</p>
+      <a class="btn primary big" href="#/new">${icon('plus', 16)} Add your first project</a>
+    </div>`;
 }
 
-async function runNow(projectId, goLive = false) {
+// ---------------- project: header and tabs ----------------
+
+const PROJECT_TABS = [
+  ['chat', 'Chat', 'chat'],
+  ['memory', 'Memory', 'book'],
+  ['runs', 'Runs', 'list'],
+  ['setup', 'Setup', 'wrench'],
+];
+
+async function renderProject() {
+  const stale = routeGuard();
+  const r = state.route;
+  const p = await api('GET', `/api/projects/${r.id}`);
+  if (stale()) return;
+  state.project = p;
+  if (r.tab === 'run-link') {
+    const run = await api('GET', `/api/runs/${r.run}`).catch(() => null);
+    location.replace(run?.conversation_id ? `#/project/${p.id}/chat/${run.conversation_id}/run/${run.id}` : `#/project/${p.id}/runs`);
+    return;
+  }
+  if (r.tab === 'chat' && !r.chat) {
+    // The project itself opens its current conversation, or a new chat when it has none yet.
+    location.replace(`#/project/${p.id}/chat/${p.conversation_id ?? 'new'}`);
+    return;
+  }
+  view.innerHTML = `<header class="project-top" id="project-header"></header><div id="tab-content" class="tab-content ${r.tab === 'chat' ? 'is-chat' : 'is-page'}"></div>`;
+  renderProjectHeader();
+  const content = $('#tab-content');
+  if (r.tab === 'chat') await renderChat(content, p, r.chat === 'new' ? 'new' : Number(r.chat), { focusRun: r.run, stale });
+  else if (r.tab === 'setup') await renderSetupTab(content);
+  else if (r.tab === 'memory') await renderMemoryTab(content);
+  else await renderRunsTab(content);
+}
+
+function renderProjectHeader() {
+  const p = state.project;
+  const r = state.route;
+  const header = $('#project-header');
+  if (!header || !p || r?.name !== 'project') return;
+  const chatTitle =
+    r.tab !== 'chat' ? '' : r.chat === 'new' ? 'New chat' : (sidebar.conversations.get(p.id) ?? []).find((c) => String(c.id) === r.chat)?.title ?? '';
+  header.innerHTML = `
+    <div class="top-row">
+      <button class="icon-btn side-open-btn" id="side-open" aria-label="Show projects">${icon('menu', 18)}</button>
+      <div class="top-title">
+        <div class="top-project"><a href="#/project/${p.id}">${esc(p.name)}</a>${agentBadge(p.agent)}${p.active_run_id ? '<span class="status running">working</span>' : ''}</div>
+        <div class="top-sub">${chatTitle ? `<span class="top-chat">${esc(chatTitle)}</span><span class="sep">·</span>` : ''}<a href="#/schedules" title="Scheduled tasks">${icon('clock', 12)} ${esc(p.schedule_text)}${p.enabled ? (p.next_run ? ` · next ${esc(fmtTime(p.next_run, p.timezone))}` : '') : ' · paused'}</a></div>
+      </div>
+      <nav class="top-tabs" aria-label="Project">${PROJECT_TABS.map(([k, l, ic]) => `<a href="#/project/${p.id}/${k}" class="${r.tab === k ? 'active' : ''}">${icon(ic, 14)}<span>${l}</span></a>`).join('')}</nav>
+      <div class="top-actions">
+        ${p.active_run_id ? '' : `<button class="ghost" id="hdr-run" title="Start a session on the standing task now">${icon('play', 13)} Run now</button>`}
+        <button class="icon-btn" id="hdr-folder" title="Open the project folder">${icon('folder', 16)}</button>
+        ${p.has_index_html ? `<button class="icon-btn" id="hdr-index" title="Open the website (index.html)">${icon('globe', 16)}</button>` : ''}
+      </div>
+    </div>
+    ${p.folder_exists ? '' : `<div class="top-note bad">The project folder was not found on this computer. Choose where it is in <a href="#/project/${p.id}/setup">Setup</a>.</div>`}
+    ${p.paused_reason && !p.enabled ? `<div class="top-note">${esc(p.paused_reason)}</div>` : ''}`;
+  $('#side-open', header).addEventListener('click', () => document.body.classList.add('side-open'));
+  $('#hdr-run', header)?.addEventListener('click', () => runNow(p.id));
+  $('#hdr-folder', header).addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'folder' })));
+  $('#hdr-index', header)?.addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'index' })));
+}
+
+async function refreshProjectHeader() {
+  if (state.route?.name !== 'project') return;
+  state.project = await api('GET', `/api/projects/${state.route.id}`);
+  renderProjectHeader();
+  chatProjectUpdated(state.project);
+  refreshSidebarSoon();
+}
+
+/** "Run now": a session on the standing task, shown in the project's conversation. */
+async function runNow(projectId) {
   const r = await attempt(() => api('POST', `/api/projects/${projectId}/run`));
   if (!r) return;
-  if (r.status === 'skipped') toast(`Run skipped: ${r.reason.replace(/^skipped: /, '')}`, 'error');
-  else {
-    toast('Run started');
-    if (goLive) location.hash = `#/project/${projectId}/live`;
+  if (r.status === 'skipped') {
+    toast(`Not started: ${r.reason.replace(/^skipped: /, '')}`, 'error');
+    return;
   }
+  toast('Session started');
+  const target = `#/project/${projectId}/chat/${r.conversationId}`;
+  if (location.hash !== target) location.hash = target;
   refreshCurrent();
-}
-
-async function stopRunFor(projectId) {
-  if (!(await confirmModal('Stop the run?', 'The agent will be cancelled. Changes it already made stay in the folder (you can restore the folder from the Runs tab).', 'Stop run'))) return;
-  await attempt(() => api('POST', `/api/projects/${projectId}/stop`), 'Stopping…');
 }
 
 // ---------------- schedule editor ----------------
@@ -533,7 +552,7 @@ async function renderNewProject() {
   if (stale()) return;
   view.innerHTML = `
     <h1>Add a project</h1>
-    <p class="muted">Set this up once. The agent you choose will then work on the project on your schedule, one step at a time.</p>
+    <p class="muted">Set this up once. The agent you choose then works on the project when you chat with it, and by itself on your schedule, one step at a time.</p>
     <form id="new-form" class="panel">
       <label>1. Project name</label>
       <input type="text" name="name" placeholder="For example: My website" required autofocus/>
@@ -559,7 +578,7 @@ async function renderNewProject() {
       <div class="muted small" style="margin-top:6px"><a href="javascript:void 0" id="use-template">Use a detailed template instead</a></div>
 
       <h2>5. When should it work on it?</h2>
-      <p class="muted small" style="margin-top:-6px">You can change this any time later in the project's Schedule tab.</p>
+      <p class="muted small" style="margin-top:-6px">You can change this any time later under Scheduled tasks.</p>
       <div id="schedule-box">${scheduleEditorHtml(null, 'Europe/Istanbul')}</div>
       <label class="inline-choice" style="margin-top:16px"><input type="checkbox" name="enabled" checked/> Turn the schedule on now</label>
 
@@ -644,76 +663,12 @@ async function renderNewProject() {
     );
     submit.disabled = false;
     if (p) {
-      toast('Project created. Press "Run now" to start the first session.');
-      location.hash = `#/project/${p.id}/runs`;
+      toast('Project created. Tell the agent what to do first, or wait for the schedule.');
+      await refreshSidebar().catch(() => {});
+      location.hash = `#/project/${p.id}/chat/new`;
       if (p.enabled) offerStartWithWindows();
     }
   });
-}
-
-// ---------------- project page ----------------
-
-const TABS = [
-  ['runs', 'Runs'],
-  ['live', 'Live'],
-  ['memory', 'Memory'],
-  ['schedule', 'Schedule'],
-  ['setup', 'Setup'],
-];
-
-async function renderProject() {
-  const stale = routeGuard();
-  const r = state.route;
-  const p = await api('GET', `/api/projects/${r.id}`);
-  if (stale()) return;
-  state.project = p;
-  view.innerHTML = `<div id="project-header"></div><div id="tab-content"></div>`;
-  renderProjectHeader();
-  const content = $('#tab-content');
-  if (r.tab === 'setup') await renderSetupTab(content);
-  else if (r.tab === 'schedule') renderScheduleTab(content);
-  else if (r.tab === 'memory') await renderMemoryTab(content);
-  else if (r.tab === 'live') await renderLiveTab(content);
-  else if (r.tab === 'runs' && r.sub) await renderRunDetail(content, Number(r.sub));
-  else await renderRunsTab(content);
-}
-
-function renderProjectHeader() {
-  const p = state.project;
-  const r = state.route;
-  const header = $('#project-header');
-  if (!header) return;
-  header.innerHTML = `
-    <div class="spread">
-      <div>
-        <h1>${esc(p.name)} ${agentBadge(p.agent)}</h1>
-        <div class="muted small">${esc(p.folder)} · ${esc(p.schedule_text)} · ${p.enabled ? `next run ${esc(fmtTime(p.next_run, p.timezone))}` : 'schedule paused'} · ${p.agent === 'kimi' ? 'uses your Kimi subscription' : `this month ${fmtCost(p.month_cost)}`}</div>
-        ${p.paused_reason ? `<div class="field-msg bad">${esc(p.paused_reason)}</div>` : ''}
-      </div>
-      <div class="row">
-        ${p.active_run_id ? `${statusChip('running')} <button class="danger" id="hdr-stop">Stop</button>` : `<button class="primary" id="hdr-run">Run now</button>`}
-        <button id="hdr-toggle">${p.enabled ? 'Pause schedule' : 'Resume schedule'}</button>
-        <button id="hdr-folder" title="Open the project folder in Explorer">Open folder</button>
-        ${p.has_index_html ? '<button id="hdr-index" title="Open index.html in your browser">Open website</button>' : ''}
-      </div>
-    </div>
-    ${p.folder_exists ? '' : '<div class="field-msg bad">The project folder cannot be found. Check the folder in the Setup tab.</div>'}
-    <div class="tabs">${TABS.map(([k, l]) => `<a href="#/project/${p.id}/${k}" class="${r.tab === k ? 'active' : ''}">${l}${k === 'live' && p.active_run_id ? '<span class="dot"></span>' : ''}</a>`).join('')}</div>`;
-  $('#hdr-run')?.addEventListener('click', () => runNow(p.id, true));
-  $('#hdr-stop')?.addEventListener('click', () => stopRunFor(p.id));
-  $('#hdr-folder').addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'folder' })));
-  $('#hdr-index')?.addEventListener('click', () => attempt(() => api('POST', `/api/projects/${p.id}/open`, { target: 'index' })));
-  $('#hdr-toggle').addEventListener('click', async () => {
-    const ok = await attempt(() => api('POST', `/api/projects/${p.id}/enabled`, { enabled: !p.enabled }), p.enabled ? 'Schedule paused' : 'Schedule resumed');
-    await refreshProjectHeader();
-    if (ok && !p.enabled) offerStartWithWindows();
-  });
-}
-
-async function refreshProjectHeader() {
-  if (state.route?.name !== 'project') return;
-  state.project = await api('GET', `/api/projects/${state.route.id}`);
-  renderProjectHeader();
 }
 
 // ---- Setup tab
@@ -827,189 +782,111 @@ async function renderSetupTab(el) {
   });
 }
 
-// ---- Schedule tab
+// ---------------- scheduled tasks ----------------
 
-function renderScheduleTab(el) {
-  const p = state.project;
-  el.innerHTML = `
-    <div class="panel">
-      <div class="spread"><h2 style="margin-top:0">When should ${esc(p.agent_label)} work on this project?</h2>
-        <label class="inline-choice"><input type="checkbox" id="sched-enabled" ${p.enabled ? 'checked' : ''}/> Schedule is on</label></div>
-      <div id="schedule-box">${scheduleEditorHtml(p.schedule, p.timezone)}</div>
-      <div class="row" style="margin-top:18px"><button class="primary" id="save-schedule">Save schedule</button></div>
-      <p class="muted small">Scheduled runs only happen while this app is running. If the computer was off at a scheduled time, the app runs once when it starts again (you can turn this off in Settings).</p>
-    </div>`;
-  const box = $('#schedule-box');
-  wireScheduleEditor(box);
-  box.addEventListener('input', () => (state.editing = true));
-  $('#sched-enabled').addEventListener('change', async (e) => {
-    const enabling = e.target.checked;
-    const ok = await attempt(() => api('POST', `/api/projects/${p.id}/enabled`, { enabled: enabling }), enabling ? 'Schedule turned on' : 'Schedule paused');
-    await refreshProjectHeader();
-    if (ok && enabling) offerStartWithWindows();
-  });
-  $('#save-schedule').addEventListener('click', async () => {
-    const { schedule, timezone } = readSchedule(box);
-    if (await attempt(() => api('PUT', `/api/projects/${p.id}`, { schedule, timezone }), 'Schedule saved')) {
-      state.editing = false;
-      await refreshProjectHeader();
+async function renderSchedules() {
+  const stale = routeGuard();
+  const projects = await api('GET', '/api/projects');
+  if (stale()) return;
+  state.projects = projects;
+  const anyOn = projects.some((p) => p.enabled);
+  view.innerHTML = `
+    <div class="page-head">
+      <h1>Scheduled tasks</h1>
+      <p class="muted">The agents work on these projects by themselves, at these times, and continue the project's current conversation. Scheduled sessions only happen while this app is running.</p>
+    </div>
+    ${anyOn && !state.settings?.start_with_windows ? `<div class="hint-box row" style="justify-content:space-between;margin-bottom:16px">
+      <span>Let the app start by itself when you turn on the computer, so a restart does not stop the schedules?</span>
+      <button class="small" id="enable-autostart">Yes, start with Windows</button></div>` : ''}
+    ${projects.length ? `<div class="tasks">${projects.map(taskHtml).join('')}</div>` : `<div class="empty panel"><h2>No projects yet</h2><p>Add a project, then choose when its agent should work on it.</p><a class="btn primary" href="#/new">${icon('plus', 14)} Add a project</a></div>`}
+    <p class="muted small" style="margin-top:18px">Claude spending this month: ${fmtCost(state.monthCost)} of the ${fmtCost(state.settings?.monthly_cap_usd)} monthly cap. Kimi uses your subscription.</p>`;
+  $('#enable-autostart')?.addEventListener('click', async () => {
+    if (await attempt(() => api('PUT', '/api/settings', { start_with_windows: true }), 'The app will now start by itself when you log in to Windows.')) {
+      await refreshState();
+      renderSchedules();
     }
   });
+  $$('[data-enabled]').forEach((box) =>
+    box.addEventListener('change', async () => {
+      const ok = await attempt(() => api('POST', `/api/projects/${box.dataset.enabled}/enabled`, { enabled: box.checked }), box.checked ? 'Schedule turned on' : 'Schedule paused');
+      await renderSchedules();
+      refreshSidebarSoon();
+      if (ok && box.checked) offerStartWithWindows();
+    })
+  );
+  $$('[data-edit]').forEach((b) => b.addEventListener('click', () => editScheduleModal(projects.find((p) => p.id === Number(b.dataset.edit)))));
+  $$('[data-run]').forEach((b) => b.addEventListener('click', () => runNow(Number(b.dataset.run))));
 }
 
-// ---- Runs tab
+function taskHtml(p) {
+  const when = p.enabled
+    ? p.next_run
+      ? ` · next run ${esc(fmtTime(p.next_run, p.timezone))}`
+      : state.budgetPaused && p.billing === 'api' ? ' · held by the monthly budget cap' : ''
+    : '';
+  return `<div class="task ${p.enabled ? 'on' : 'off'}">
+      <div class="task-main">
+        <div class="task-title"><a href="#/project/${p.id}">${esc(p.name)}</a>${agentBadge(p.agent)}${p.active_run_id ? statusChip('running') : ''}</div>
+        <div class="task-when">${icon('clock', 14)} ${esc(p.schedule_text)}${when}</div>
+        <div class="task-last">${p.last_run ? `Last session ${esc(timeAgo(p.last_run.started_at))}: ${statusChip(p.last_run.status)} ${runCost(p.agent, p.last_run.cost_usd)}` : 'No sessions yet'}${p.agent === 'kimi' ? '' : ` · this month ${fmtCost(p.month_cost)}`}</div>
+        ${p.paused_reason && !p.enabled ? `<div class="task-note">${esc(p.paused_reason)}</div>` : ''}
+        ${p.folder_exists ? '' : '<div class="task-note bad">The project folder was not found on this computer.</div>'}
+      </div>
+      <div class="task-actions">
+        <label class="switch" title="${p.enabled ? 'The schedule is on' : 'The schedule is off'}"><input type="checkbox" data-enabled="${p.id}" ${p.enabled ? 'checked' : ''}/><span class="slider"></span><span class="switch-label">${p.enabled ? 'On' : 'Off'}</span></label>
+        <button data-edit="${p.id}">Change schedule</button>
+        <button data-run="${p.id}" ${p.active_run_id ? 'disabled title="A session is running"' : ''}>${icon('play', 12)} Run now</button>
+      </div>
+    </div>`;
+}
+
+function editScheduleModal(p) {
+  if (!p) return;
+  modal(
+    `<h2>When should ${esc(agentLabel(p.agent))} work on ${esc(p.name)}?</h2>
+     <div id="schedule-box">${scheduleEditorHtml(p.schedule, p.timezone)}</div>
+     <p class="muted small">Scheduled sessions only happen while this app is running. If the computer was off at a scheduled time, the app runs once when it starts again (you can turn this off in Settings).</p>
+     <div class="row" style="justify-content:flex-end"><button data-close>Cancel</button><button class="primary" id="save-schedule">Save schedule</button></div>`,
+    (el, close) => {
+      const box = $('#schedule-box', el);
+      wireScheduleEditor(box);
+      $('#save-schedule', el).addEventListener('click', async () => {
+        const { schedule, timezone } = readSchedule(box);
+        if (await attempt(() => api('PUT', `/api/projects/${p.id}`, { schedule, timezone }), 'Schedule saved')) {
+          close();
+          refreshCurrent();
+        }
+      });
+    }
+  );
+}
+
+// ---- Runs tab: every session, newest first; a row opens it in its conversation
 
 async function renderRunsTab(el) {
   const p = state.project;
   const runs = await api('GET', `/api/projects/${p.id}/runs`);
   if (!runs.length) {
-    el.innerHTML = `<div class="empty panel"><h2>No runs yet</h2><p>Press <b>Run now</b> to start the first session, or wait for the schedule.</p></div>`;
+    el.innerHTML = `<div class="empty panel"><h2>No sessions yet</h2><p>Send a message in the Chat tab, press <b>Run now</b>, or wait for the schedule.</p></div>`;
     return;
   }
+  const how = { schedule: 'Schedule', chat: 'Chat', manual: 'Run now' };
   el.innerHTML = `
-    <table>
-      <thead><tr><th>#</th><th>Started</th><th>Trigger</th><th>Status</th><th>Duration</th><th>Steps</th><th>Cost</th><th>Files changed</th></tr></thead>
+    <table class="runs-table">
+      <thead><tr><th>#</th><th>Started</th><th>Started by</th><th>Status</th><th>Duration</th><th>Steps</th><th>Cost</th><th>Files changed</th></tr></thead>
       <tbody>${runs
         .map(
-          (r) => `<tr class="clickable" data-run="${r.id}">
-            <td>${r.id}</td><td>${esc(fmtTime(r.started_at))}</td><td>${r.trigger === 'schedule' ? 'Schedule' : 'Manual'}</td>
+          (r) => `<tr class="${r.conversation_id ? 'clickable' : ''}" data-run="${r.id}" data-conversation="${r.conversation_id ?? ''}">
+            <td>${r.id}</td><td>${esc(fmtTime(r.started_at))}</td><td>${how[r.trigger] ?? esc(r.trigger)}</td>
             <td>${statusChip(r.status)}${r.status === 'skipped' && r.error ? `<div class="muted small">${esc(r.error.replace(/^skipped: /, ''))}</div>` : ''}</td>
             <td>${fmtDuration(r.duration_ms)}</td><td>${r.turns ?? '—'}</td><td>${r.status === 'skipped' ? '—' : runCost(r.agent ?? p.agent, r.cost_usd)}</td><td>${r.changed_count ?? '—'}</td></tr>`
         )
         .join('')}</tbody>
     </table>`;
-  $$('tr[data-run]', el).forEach((tr) => tr.addEventListener('click', () => (location.hash = `#/project/${p.id}/runs/${tr.dataset.run}`)));
-}
-
-// ---- Run log rendering (shared by run detail and live view)
-
-function logEntryHtml(e) {
-  const t = new Date(e.ts).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-  let body;
-  if (e.type === 'assistant') body = `<div class="body markdown">${md(e.content)}</div>`;
-  else if (e.type === 'prompt') body = `<div class="body"><details><summary>Prompt sent to the agent (preamble + memory snapshot + task)</summary>${esc(e.content)}</details></div>`;
-  else if ((e.type === 'tool_result' || e.type === 'tool_error') && (e.content.length > 240 || e.content.split('\n').length > 4)) {
-    const first = e.content.split('\n')[0].slice(0, 160);
-    body = `<div class="body"><details><summary>${esc(first)} …</summary>${esc(e.content)}</details></div>`;
-  } else body = `<div class="body">${esc(e.content)}</div>`;
-  return `<div class="entry ${esc(e.type)}"><div class="ts">${t}</div>${body}</div>`;
-}
-
-function appendLog(container, entries) {
-  const nearBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 80;
-  container.insertAdjacentHTML('beforeend', entries.map(logEntryHtml).join(''));
-  if (nearBottom) container.scrollTop = container.scrollHeight;
-}
-
-function startLiveLog(runId, container, existing) {
-  const buffered = state.live?.runId === runId ? state.live.buffer : [];
-  state.live = { runId, lastSeq: 0, buffer: [], container };
-  appendLog(container, existing);
-  state.live.lastSeq = existing.length ? existing[existing.length - 1].seq : 0;
-  const pending = buffered.filter((e) => e.seq > state.live.lastSeq);
-  if (pending.length) {
-    appendLog(container, pending);
-    state.live.lastSeq = pending[pending.length - 1].seq;
-  }
-  container.scrollTop = container.scrollHeight;
-}
-
-function onLiveLog(entry) {
-  const live = state.live;
-  if (!live || live.runId !== entry.runId) return;
-  if (!live.container) {
-    live.buffer.push(entry);
-    return;
-  }
-  if (entry.seq <= live.lastSeq) return;
-  live.lastSeq = entry.seq;
-  appendLog(live.container, [entry]);
-}
-
-function filesHtml(changed) {
-  if (!changed) return '<p class="muted">Not recorded.</p>';
-  const total = changed.added.length + changed.changed.length + changed.removed.length;
-  if (!total) return '<p class="muted">No files changed.</p>';
-  const items = [
-    ...changed.added.map((f) => `<div class="a">+ ${esc(f)}</div>`),
-    ...changed.changed.map((f) => `<div class="m">~ ${esc(f)}</div>`),
-    ...changed.removed.map((f) => `<div class="d">− ${esc(f)}</div>`),
-  ];
-  return `<p class="muted small">${changed.added.length} added · ${changed.changed.length} changed · ${changed.removed.length} removed</p><div class="files">${items.join('')}</div>`;
-}
-
-async function renderRunDetail(el, runId) {
-  const p = state.project;
-  state.live = { runId, lastSeq: 0, buffer: [], container: null };
-  const run = await api('GET', `/api/runs/${runId}`);
-  el.innerHTML = `
-    <p><a href="#/project/${p.id}/runs">← All runs</a></p>
-    <div class="panel">
-      <div class="spread"><h2 style="margin:0">Run #${run.id} ${statusChip(run.status)}</h2>
-        <div class="row">
-          ${run.status === 'running' ? `<button class="danger" id="run-stop">Stop</button>` : ''}
-          ${run.restore_available && run.status !== 'running' ? `<button id="run-restore">Restore folder to before this run</button>` : ''}
-        </div></div>
-      <dl class="kv" style="margin-top:14px">
-        <dt>Started</dt><dd>${esc(fmtTime(run.started_at))} (${run.trigger === 'schedule' ? 'schedule' : 'manual'})</dd>
-        <dt>Duration</dt><dd>${fmtDuration(run.duration_ms)}</dd>
-        <dt>Steps</dt><dd>${run.turns ?? '—'}</dd>
-        <dt>Agent</dt><dd>${agentBadge(run.agent ?? p.agent)} ${run.model ? esc(kimiModelName(agentsCache?.kimi, run.model)) : ''}${run.effort ? ` · thinking ${esc(run.effort)}` : ''}</dd>
-        <dt>Cost</dt><dd>${(run.agent ?? p.agent) === 'kimi' ? 'Included in your Kimi subscription' : fmtCost(run.cost_usd)}</dd>
-        <dt>Session</dt><dd>${run.session_mode ? esc(run.session_mode) : '—'} <span class="muted small mono">${esc(run.session_id ?? '')}</span></dd>
-        <dt>Restore point</dt><dd>${run.restore_ref ? (run.restore_ref.type === 'git' ? `git commit <span class="mono">${esc(run.restore_ref.commit?.slice(0, 10))}</span>` : run.restore_ref.type === 'zip' ? (run.restore_available ? 'zip backup' : 'zip backup (already removed – only the last 5 are kept)') : esc(run.restore_ref.warning ?? 'none')) : '—'}</dd>
-        ${run.error ? `<dt>Problem</dt><dd class="field-msg bad">${esc(run.error)}</dd>` : ''}
-      </dl>
-      ${run.agent_note ? `<p class="hint-box" style="margin-top:12px">The agent did not write a progress note, so the app added one to the Progress log for the next session.</p>` : ''}
-    </div>
-    ${run.summary ? `<div class="panel"><h3 style="margin-top:0">Agent's summary</h3><div class="markdown">${md(run.summary)}</div></div>` : ''}
-    <div class="panel"><h3 style="margin-top:0">Changed files</h3>${filesHtml(run.changed_files)}</div>
-    <div class="panel"><h3 style="margin-top:0">Memory entries written</h3>${
-      run.memory_written?.length ? `<div class="files">${run.memory_written.map((m) => `<div>${esc(m)}</div>`).join('')}</div>` : '<p class="muted">None.</p>'
-    }</div>
-    <h3>Full log</h3>
-    <div class="log" id="run-log"></div>`;
-  startLiveLog(run.id, $('#run-log'), run.logs);
-  if (run.status !== 'running') state.live = null;
-  $('#run-stop')?.addEventListener('click', () => stopRunFor(p.id));
-  $('#run-restore')?.addEventListener('click', async () => {
-    const ok = await confirmModal(
-      'Restore the project folder?',
-      `The folder <b>${esc(p.folder)}</b> will be put back exactly as it was before run #${run.id} started. All changes made since then — by this run, later runs or yourself — will be lost. Memory is not changed.`,
-      'Restore folder'
-    );
-    if (!ok) return;
-    const r = await attempt(() => api('POST', `/api/runs/${run.id}/restore`));
-    if (!r) return;
-    if (r.problems?.length) {
-      toast(`Folder restored, but ${r.problems.length} file(s) could not be replaced because they are open in another program: ${r.problems.slice(0, 3).join(', ')}`, 'error');
-    } else {
-      toast('Folder restored');
-    }
+  $$('tr[data-conversation]', el).forEach((tr) => {
+    if (!tr.dataset.conversation) return;
+    tr.addEventListener('click', () => (location.hash = `#/project/${p.id}/chat/${tr.dataset.conversation}/run/${tr.dataset.run}`));
   });
-}
-
-// ---- Live tab
-
-async function renderLiveTab(el) {
-  const p = state.project;
-  if (!p.active_run_id) {
-    const runs = await api('GET', `/api/projects/${p.id}/runs?limit=1`);
-    el.innerHTML = `<div class="empty panel"><h2>No run is active</h2><p>When a run is active, its output streams here live.</p>
-      <div class="row" style="justify-content:center"><button class="primary" id="live-run">Run now</button>
-      ${runs[0] ? `<a class="btn" href="#/project/${p.id}/runs/${runs[0].id}">Open the last run</a>` : ''}</div></div>`;
-    $('#live-run').addEventListener('click', () => runNow(p.id, true));
-    return;
-  }
-  const runId = p.active_run_id;
-  state.live = { runId, lastSeq: 0, buffer: [], container: null };
-  const run = await api('GET', `/api/runs/${runId}`);
-  el.innerHTML = `
-    <div class="spread" style="margin-bottom:12px"><div>${statusChip(run.status)} Run #${run.id} · started ${esc(fmtTime(run.started_at))}</div>
-      <div class="row"><a class="btn" href="#/project/${p.id}/runs/${run.id}">Run details</a><button class="danger" id="live-stop">Stop</button></div></div>
-    <div class="log" id="live-log"></div>`;
-  startLiveLog(run.id, $('#live-log'), run.logs);
-  $('#live-stop').addEventListener('click', () => stopRunFor(p.id));
 }
 
 // ---- Memory tab
@@ -1567,19 +1444,17 @@ function refreshCurrent() {
     const r = state.route;
     try {
       await refreshState();
-      if (r?.name === 'dashboard') await renderDashboard();
+      refreshSidebarSoon();
+      if (r?.name === 'schedules') await renderSchedules();
       else if (r?.name === 'project') {
-        const wasActive = state.project?.active_run_id;
-        await refreshProjectHeader();
+        const before = state.project;
+        state.project = await api('GET', `/api/projects/${r.id}`);
+        renderProjectHeader();
+        chatProjectUpdated(state.project);
         const content = $('#tab-content');
         if (!content || state.editing) return;
-        if (r.tab === 'runs' && !r.sub) await renderRunsTab(content);
-        else if (r.tab === 'runs' && r.sub && !state.live) {
-          /* finished run detail: nothing to refresh */
-        } else if (r.tab === 'runs' && r.sub && state.live && wasActive && !state.project.active_run_id) await renderRunDetail(content, Number(r.sub));
-        else if (r.tab === 'live' && wasActive && !state.project.active_run_id) location.hash = `#/project/${r.id}/runs/${wasActive}`;
-        else if (r.tab === 'live' && wasActive !== state.project.active_run_id) await renderLiveTab(content);
-        else if (r.tab === 'memory' && !state.project.active_run_id && wasActive) await renderMemoryTab(content);
+        if (r.tab === 'runs') await renderRunsTab(content);
+        else if (r.tab === 'memory' && before?.active_run_id && !state.project.active_run_id) await renderMemoryTab(content);
       }
     } catch {
       /* ignore transient errors */
@@ -1589,6 +1464,8 @@ function refreshCurrent() {
 
 let offlineTimer = null;
 let offline = false;
+/** The connection to the app dropped: updates may have been missed, so the page reloads once it is back. */
+let missedEvents = false;
 
 function showOffline() {
   if ($('#offline')) return;
@@ -1598,7 +1475,7 @@ function showOffline() {
   el.innerHTML = state.shutdownRequested
     ? `<div class="panel"><h2>The app has been shut down</h2><p>To start it again, double-click the <b>Claude Agent Runner</b> icon on your desktop (or start.bat).</p></div>`
     : `<div class="panel"><h2>The app is not running</h2>
-        <p>This page cannot reach the app. It may be restarting — this page reconnects by itself.</p>
+        <p>This page cannot reach the app. It may be restarting; this page reconnects by itself.</p>
         <p>If this message stays, start the app again by double-clicking the <b>Claude Agent Runner</b> icon on your desktop (or start.bat).</p></div>`;
   document.body.append(el);
 }
@@ -1611,11 +1488,16 @@ function connectEvents() {
     if (offline) {
       offline = false;
       $('#offline')?.remove();
+    }
+    if (missedEvents) {
+      missedEvents = false;
       refreshState().catch(() => {});
+      refreshSidebarSoon();
       if (!state.editing) router();
     }
   };
   es.onerror = () => {
+    missedEvents = true;
     if (es.readyState === EventSource.CLOSED) setTimeout(connectEvents, 3000);
     if (!offlineTimer && !offline) {
       offlineTimer = setTimeout(() => {
@@ -1627,8 +1509,14 @@ function connectEvents() {
   };
   es.onmessage = (msg) => {
     const ev = JSON.parse(msg.data);
-    if (ev.type === 'log') onLiveLog(ev.data);
-    else if (['run-updated', 'projects-changed', 'budget-paused'].includes(ev.type)) refreshCurrent();
+    if (ev.type === 'log') chatOnLog(ev.data);
+    else if (ev.type === 'run-updated') {
+      chatOnRunUpdated(ev.data);
+      refreshCurrent();
+    } else if (['projects-changed', 'budget-paused', 'chat-queued'].includes(ev.type)) {
+      if (ev.type === 'chat-queued') chatOnQueue(ev.data);
+      refreshCurrent();
+    }
     else if (ev.type === 'memory-changed' && state.route?.tab === 'memory' && !state.editing) {
       loadMemory().then(renderMemorySection);
     }
@@ -1639,9 +1527,12 @@ window.addEventListener('hashchange', router);
 window.addEventListener('beforeunload', (e) => {
   if (state.editing) e.preventDefault();
 });
+$('#side-close').addEventListener('click', () => document.body.classList.remove('side-open'));
+$('#side-backdrop').addEventListener('click', () => document.body.classList.remove('side-open'));
 
 (async function init() {
   await refreshState().catch(() => {});
+  await refreshSidebar().catch(() => {});
   connectEvents();
   router();
 })();

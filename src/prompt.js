@@ -14,6 +14,65 @@ You are running unattended as a scheduled session of the "Claude Agent Runner". 
 - The owner may not be technical. Write progress entries and your final summary in short, plain language.
 `;
 
+/** The same rules for sessions the owner starts by chatting in the app: they are watching, and can reply. */
+export const CHAT_SYSTEM_APPEND = SYSTEM_APPEND.replace(
+  /^You are running unattended[^\n]*\n/m,
+  'You are working on this project for its owner through the "Claude Agent Runner" app. The owner chats with you in the app and watches your work live, but can only reply after you finish your turn. Never wait for input: do the work, or ask your question at the end of your reply and stop.\n'
+);
+
+/** How the progress note is kept in chat sessions (only when something changed). */
+const chatMemoryRule = (stamp) => `Your memory (the "memory" tool, paths under /memories) is how this conversation and the scheduled sessions hand over to each other.
+- Check memory and the project folder before you change anything.
+- If you change files or make decisions, keep /memories/plan.md up to date and, before you finish, APPEND a dated entry to the end of /memories/progress.md in this form:
+  ## ${stamp} — <short title>
+  - Done: ...
+  - Failed / problems: ...
+  - Next step: <the exact next step>
+- Questions that change nothing need no progress entry.`;
+
+/**
+ * The first message of a new conversation started from the chat: standing rules, memory snapshot and the message.
+ */
+export function buildChatPrompt(project, message, { now = new Date() } = {}) {
+  const brief = getEntry(project.id, '/memories/brief.md')?.content ?? '(missing)';
+  const plan = getEntry(project.id, '/memories/plan.md')?.content ?? '';
+  const progress = getEntry(project.id, '/memories/progress.md')?.content ?? '';
+  const localTime = sessionStamp(project.timezone, now);
+  return `# Standing instructions for this conversation
+
+The owner of this project is chatting with you in the app. Earlier sessions (scheduled or chat) have already worked on the project.
+${chatMemoryRule(localTime)}
+
+Current date and time: ${localTime} (${project.timezone}).
+
+# Memory snapshot (taken by the app now)
+
+<brief path="/memories/brief.md">
+${brief.trim()}
+</brief>
+
+<open_plan_steps path="/memories/plan.md">
+${openPlanSteps(plan)}
+</open_plan_steps>
+
+<latest_progress path="/memories/progress.md">
+${lastProgress(progress)}
+</latest_progress>
+
+# Message from the owner
+
+${String(message).trim()}
+`;
+}
+
+/** A message from the owner in a conversation that is already going on. */
+export function chatTurnPrompt(project, message, { now = new Date() } = {}) {
+  const localTime = sessionStamp(project.timezone, now);
+  return `[Message from the owner, sent through the app at ${localTime}. If you change files or make decisions, record them in memory as usual (plan, and a progress entry appended at the end of /memories/progress.md titled "## ${localTime} — ...").]
+
+${String(message).trim()}`;
+}
+
 const preamble = (stamp) => `# Standing instructions for this session
 
 This is one session in a series of scheduled working sessions on the same project. Earlier sessions have already done work; continue from where they stopped. Your memory (the "memory" tool, paths under /memories) is how sessions hand over to each other.

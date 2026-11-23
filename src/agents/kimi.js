@@ -65,7 +65,11 @@ function describeKimiTool(call) {
   const command = input.command ?? input.cmd;
   if ((call.kind === 'execute' || /^(bash|shell|powershell)/i.test(title)) && typeof command === 'string') return { type: 'tool', content: `$ ${clip(command, 800)}` };
   const location = call.locations?.[0]?.path;
-  const detail = [input.path, input.file_path, input.pattern, input.query, input.url, location].find((v) => typeof v === 'string' && v && !title.includes(v));
+  // Kimi's titles may write a path with / where the input has \ (or the other way round): compare them alike.
+  const same = (s) => String(s).replace(/\\/g, '/').toLowerCase();
+  const detail = [input.path, input.file_path, input.pattern, input.query, input.url, location].find(
+    (v) => typeof v === 'string' && v && !same(title).includes(same(v)) && !same(title).includes(same(v).split('/').pop())
+  );
   const label = `${title || call.kind || 'tool'}${detail ? ` ${detail}` : ''}`;
   return { type: 'tool', content: clip(label, 600) };
 }
@@ -84,7 +88,7 @@ function toolResultText(update) {
  * Runs one Kimi session. Returns a result in the shape shared by all agents:
  * { sessionId, resumed, resumeFailedReason, outcomes[], summary, turns, error, fatal, costTotal (null), model }.
  */
-export async function runKimiConversation({ ctx, projectId, folder, limits, prompt, resumeId, runId, log, memoryWritten, onTurnEnd }) {
+export async function runKimiConversation({ ctx, projectId, folder, limits, prompt, freshPrompt = prompt, resumeId, runId, log, memoryWritten, onTurnEnd }) {
   const out = { sessionId: null, resumed: false, resumeFailedReason: null, outcomes: [], summary: null, turns: 0, error: null, fatal: false, costTotal: null, model: limits.model ?? null };
   const cmd = kimiCommand();
   if (!cmd) {
@@ -116,8 +120,10 @@ export async function runKimiConversation({ ctx, projectId, folder, limits, prom
   let textBuffer = '';
   let lastFlush = Date.now();
   let lastAssistant = '';
-  // The step limit counts the steps (tool calls) of the main work; the short progress-note turn is exempt.
+  // The step limit counts the steps (tool calls) of each piece of work: the first prompt and every message from
+  // the owner. The short progress-note turn is exempt.
   let limitActive = true;
+  let stepsThisTurn = 0;
   let forcedLimit = false;
   let planText = '';
   let lastActivity = Date.now();
@@ -165,10 +171,11 @@ export async function runKimiConversation({ ctx, projectId, folder, limits, prom
       case 'tool_call': {
         flush();
         out.turns++;
+        stepsThisTurn++;
         if (u.status !== 'completed' && u.status !== 'failed') openCalls.add(u.toolCallId);
         calls.set(u.toolCallId, { ...u, logged: false });
         if (hasInput(u.rawInput)) logCall(u.toolCallId);
-        if (limitActive && out.turns > limits.maxTurns && !forcedLimit && !ctx.stopReason) {
+        if (limitActive && stepsThisTurn > limits.maxTurns && !forcedLimit && !ctx.stopReason) {
           forcedLimit = true;
           log('warning', `The step limit (${limits.maxTurns} steps) was reached, so the session is being stopped.`);
           if (sessionId) rpc.notify('session/cancel', { sessionId });
@@ -290,8 +297,10 @@ export async function runKimiConversation({ ctx, projectId, folder, limits, prom
     const modelName = offered.find((m) => m.id === out.model)?.name ?? out.model ?? 'default';
     log('system', `Kimi ${out.resumed ? 'continues its previous session' : 'started a new session'} · model ${modelName} · thinking ${limits.effort ?? 'default'} · session ${sessionId}`);
 
-    let text = prompt;
+    // A fresh session (also when continuing the old one failed) needs the full first prompt with the memory snapshot.
+    let text = out.resumed ? prompt : freshPrompt;
     while (text && !ctx.stopReason) {
+      stepsThisTurn = 0;
       let response;
       try {
         response = await rpc.request('session/prompt', { sessionId, prompt: [{ type: 'text', text }] });
@@ -312,8 +321,9 @@ export async function runKimiConversation({ ctx, projectId, folder, limits, prom
       if (outcome === 'success' && out.outcomes.length === 1) out.summary = lastAssistant || null;
       log('result', `${outcome === 'success' ? 'Finished' : 'Ended'} (${response?.stopReason ?? outcome}) · ${out.turns} steps · included in your Kimi subscription`);
       if (outcome === 'error' && !out.error) out.error = `Kimi stopped the session (${response?.stopReason ?? 'unknown reason'}).`;
-      text = outcome === 'success' ? onTurnEnd() : null;
-      limitActive = false;
+      const next = outcome === 'success' ? onTurnEnd() : null;
+      text = next == null ? null : typeof next === 'string' ? next : next.text;
+      limitActive = Boolean(next && typeof next === 'object' && next.limited);
     }
   } catch (err) {
     flush();

@@ -1,6 +1,7 @@
 // A stand-in for "kimi acp" used by the tests: speaks the Agent Client Protocol over stdin/stdout,
 // reads and writes the project memory through the MCP address it is given, and edits files in its folder.
-// Behaviour switches come from markers in the prompt: [fake:no-progress], [fake:slow], [fake:loop].
+// Behaviour switches come from markers in the prompt: [fake:no-progress], [fake:slow], [fake:loop], [fake:answer],
+// [fake:continues], [fake:wait] (1.5 s before working) or [fake:wait=<ms>].
 import fs from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -68,11 +69,19 @@ async function prompt(params) {
   const text = params.prompt.map((p) => p.text ?? '').join('\n');
   const sid = params.sessionId;
   cancelled.delete(sid);
+  fs.appendFileSync(path.join(process.env.FAKE_KIMI_STATE, 'prompts.jsonl'), `${JSON.stringify({ sessionId: sid, text })}\n`);
   if (/without appending a new entry/.test(text)) {
     await writeProgress(session, sid, session.cwd, 'Progress written after reminder');
     update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Progress entry written.' } });
     return { stopReason: 'end_turn' };
   }
+  if (/\[fake:answer\]/.test(text)) {
+    // A question that needs no work: just an answer, no tools, no files.
+    update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Here is my answer: the site has three pages.' } });
+    return { stopReason: 'end_turn' };
+  }
+  const wait = text.match(/\[fake:wait(?:=(\d+))?\]/);
+  if (wait) await sleep(Number(wait[1] ?? 1500));
   update(sid, { sessionUpdate: 'agent_message_chunk', content: { type: 'text', text: 'Checking memory first. ' } });
   await tool(sid, 'mcp__agent_memory__memory', 'other', { command: 'view', path: '/memories' }, () => memoryCall(session, { command: 'view', path: '/memories' }));
   if (/\[fake:slow\]/.test(text)) {

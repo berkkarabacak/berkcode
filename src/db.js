@@ -106,6 +106,18 @@ CREATE TABLE IF NOT EXISTS run_logs (
 );
 CREATE INDEX IF NOT EXISTS run_logs_run ON run_logs(run_id, seq);
 
+-- Messages from the owner that wait for their turn (the queue in runner.js). held_reason: kept, but only sent
+-- when the owner says so.
+CREATE TABLE IF NOT EXISTS chat_queue (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+  text TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  new_conversation INTEGER NOT NULL DEFAULT 0,
+  held_reason TEXT
+);
+CREATE INDEX IF NOT EXISTS chat_queue_project ON chat_queue(project_id, id);
+
 CREATE TABLE IF NOT EXISTS memory_entries (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   project_id INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -166,6 +178,40 @@ addColumnIfMissing('runs', 'effort', 'TEXT');
 if (addColumnIfMissing('projects', 'session_folder', 'TEXT')) {
   db.exec("UPDATE projects SET session_folder = folder WHERE session_id IS NOT NULL AND (folder LIKE '_:%' OR folder LIKE '\\\\%')");
 }
+
+// Conversations: every run belongs to one (scheduled runs and chat messages alike). A conversation is one agent
+// session as the owner sees it; its id is the id of the run that started it. runs.user_message is the owner's
+// message for runs started from the chat.
+const addedConversations = addColumnIfMissing('runs', 'conversation_id', 'INTEGER');
+addColumnIfMissing('runs', 'user_message', 'TEXT');
+addColumnIfMissing('projects', 'conversation_id', 'INTEGER');
+if (addedConversations) backfillConversations();
+
+/** Groups the runs made before conversations existed: a fresh session starts a new conversation. */
+function backfillConversations() {
+  const setRun = db.prepare('UPDATE runs SET conversation_id = ? WHERE id = ?');
+  const setProject = db.prepare('UPDATE projects SET conversation_id = ? WHERE id = ?');
+  db.exec('BEGIN');
+  try {
+    for (const { id: projectId } of db.prepare('SELECT id FROM projects').all()) {
+      let current = null;
+      for (const run of db.prepare("SELECT id, status, session_mode FROM runs WHERE project_id = ? ORDER BY id").all(projectId)) {
+        if (run.status === 'skipped') continue;
+        if (!current || String(run.session_mode ?? '').startsWith('fresh')) current = run.id;
+        setRun.run(current, run.id);
+      }
+      if (current) setProject.run(current, projectId);
+    }
+    db.exec('COMMIT');
+  } catch (err) {
+    db.exec('ROLLBACK');
+    throw err;
+  }
+}
+db.exec('CREATE INDEX IF NOT EXISTS runs_conversation ON runs(conversation_id)');
+// The "Resume schedule" button became the switch under Scheduled tasks.
+db.exec(`UPDATE projects SET paused_reason = REPLACE(paused_reason, 'then press "Resume schedule".', 'then turn the schedule on again under Scheduled tasks.')
+  WHERE paused_reason LIKE '%then press "Resume schedule".%'`);
 
 // Shown to the owner by the browser UI until they acknowledge it.
 if (opened.recovered) {
