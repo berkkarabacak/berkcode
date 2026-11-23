@@ -8,6 +8,7 @@ import { db, backupDatabaseIfDue } from './db.js';
 import { bus, emit } from './events.js';
 import { getSetting, setSetting, publicSettings, DEFAULTS } from './settings.js';
 import { importKeyFile } from './keyfile.js';
+import { writeShareCopy, applyCopySettings, SHARE_FILE_NAME } from './shareCopy.js';
 import { listProjects, getProject, createProject, updateProject, deleteProject, setProjectFields, monthCost, budgetPaused, effectiveLimits, AGENTS, KIMI_EFFORTS } from './projects.js';
 import { kimiStatus } from './agents/kimiInfo.js';
 import { mountMemoryMcp, setServerPort } from './mcpHttp.js';
@@ -27,7 +28,9 @@ import { setStartWithWindows, syncStartWithWindows, startWithWindowsHere } from 
 import { trayStatus } from './status.js';
 import { initTray, startTray, trayAvailable, trayCheckedIn, trayShuttingDown } from './tray.js';
 import { BRIEF_TEMPLATE, DEFAULT_TASK_PROMPT, buildBrief } from './templates.js';
-import { pickFolder, suggestProjectFolder, openPath, diagnostics, documentsDir, uniqueFolder, moveFolder, openPowerShellWindow } from './system.js';
+import {
+  pickFolder, suggestProjectFolder, openPath, showInFolder, diagnostics, documentsDir, desktopDir, uniqueFolder, moveFolder, openPowerShellWindow,
+} from './system.js';
 import { kimiCommand, invalidateKimiStatus, kimiSetupScript } from './agents/kimiInfo.js';
 
 const EXIT_ALREADY_RUNNING = 3;
@@ -225,7 +228,7 @@ app.put('/api/settings', wrap(async (req) => {
       setSetting(key, wanted);
       continue;
     }
-    if (key in DEFAULTS && !['heartbeat', 'budget_paused_month', 'key_file_hash', 'api_key_source'].includes(key)) setSetting(key, value);
+    if (key in DEFAULTS && !['heartbeat', 'budget_paused_month', 'key_file_hash', 'api_key_source', 'copy_settings_hash'].includes(key)) setSetting(key, value);
   }
   if (budgetPaused() && monthCost() < getSetting('monthly_cap_usd')) setSetting('budget_paused_month', '');
   // Switching the icon on starts it right away; switching it off makes it close itself within a few seconds.
@@ -623,6 +626,36 @@ app.post('/api/runs/:id/restore', wrap(async (req) => {
   return { ok: true, problems };
 }));
 
+// ---------- Sharing the app with family and friends ----------
+
+const shareTarget = async () => path.join(await desktopDir(), SHARE_FILE_NAME);
+
+/** Saves a ZIP of the app for another computer on the Desktop, with the Claude API key if asked (never sent back). */
+app.post('/api/share-copy', wrap(async (req) => {
+  const includeKey = Boolean(req.body?.include_key);
+  const key = getSetting('api_key');
+  if (includeKey && !key) throw httpError(400, 'There is no Claude API key to include yet. Enter it under "Claude API key" first, or untick the box.');
+  const capText = String(req.body?.monthly_cap_usd ?? '').trim();
+  const cap = capText === '' ? null : Number(capText);
+  if (cap != null && !(cap >= 1)) throw httpError(400, 'Enter a monthly limit of at least 1 dollar, or leave the field empty.');
+  const target = await shareTarget();
+  try {
+    const r = await writeShareCopy(target, { key: includeKey ? key : null, settings: { monthly_cap_usd: cap } });
+    return { file: r.file, files: r.files, bytes: r.bytes, include_key: includeKey, monthly_cap_usd: cap };
+  } catch (err) {
+    if (['EPERM', 'EBUSY', 'EACCES'].includes(err.code)) {
+      throw httpError(409, `The ZIP file could not be saved, because the old one is open in another program: ${target}. Close it and try again.`);
+    }
+    throw err;
+  }
+}));
+
+app.post('/api/share-copy/show', wrap(async () => {
+  const target = await shareTarget();
+  if (!fs.existsSync(target)) throw httpError(404, 'The ZIP file is not on the Desktop any more. Create it again.');
+  showInFolder(target);
+}));
+
 // ---------- Live updates (Server-Sent Events) ----------
 
 app.get('/api/events', (req, res) => {
@@ -797,6 +830,12 @@ try {
   else if (keyResult && keyResult.reason !== 'unchanged') console.log(`${keyResult.file}: ${keyResult.reason}.`);
 } catch (err) {
   console.error('Could not read the API key file:', err.message);
+}
+try {
+  const applied = applyCopySettings();
+  if (applied?.length) console.log(`Applied the settings this copy of the app came with: ${applied.join(', ')}.`);
+} catch (err) {
+  console.error('Could not apply copy-settings.json:', err.message);
 }
 
 recoverInterruptedRuns();

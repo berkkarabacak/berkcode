@@ -33,6 +33,24 @@ export async function documentsDir() {
   return dir;
 }
 
+let desktopCache = null;
+/** The user's Desktop folder (which OneDrive may have moved). */
+export async function desktopDir() {
+  if (desktopCache) return desktopCache;
+  let dir = null;
+  if (isWindows) {
+    try {
+      dir = await powershell("[Environment]::GetFolderPath('Desktop')");
+    } catch {
+      /* fall back below */
+    }
+  }
+  if (!dir || !fs.existsSync(dir)) dir = path.join(os.homedir(), 'Desktop');
+  if (!fs.existsSync(dir)) dir = os.homedir();
+  desktopCache = dir;
+  return dir;
+}
+
 const cleanName = (name) =>
   String(name || 'My project').replace(/[<>:"/\\|?*\x00-\x1f]/g, ' ').replace(/\s+/g, ' ').trim().replace(/[. ]+$/, '') || 'My project';
 
@@ -108,6 +126,13 @@ export function openPath(target) {
   } else {
     spawn(process.platform === 'darwin' ? 'open' : 'xdg-open', [target], { detached: true, stdio: 'ignore' }).unref();
   }
+}
+
+/** Opens Explorer with `file` selected. */
+export function showInFolder(file) {
+  if (!fs.existsSync(file)) throw new Error(`Not found: ${file}`);
+  if (!isWindows) return openPath(path.dirname(file));
+  spawn('explorer.exe', [`/select,"${file}"`], { detached: true, stdio: 'ignore', windowsHide: false, windowsVerbatimArguments: true }).unref();
 }
 
 async function commandVersion(cmd, args) {

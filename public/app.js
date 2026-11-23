@@ -1280,6 +1280,16 @@ async function renderSettings() {
       <div id="outside-projects"></div>
     </div>
     <div class="panel" style="margin-top:24px">
+      <h2 style="margin-top:0">Share the app with family and friends</h2>
+      <p class="muted small">Makes one ZIP file of this app for another computer. They unzip it and double-click <b>start.bat</b>, just like you did. Your projects, their history and your settings stay here.</p>
+      <label class="inline-choice"><input type="checkbox" id="share-key" ${s.has_api_key ? 'checked' : 'disabled'}/> Include my Claude API key: they use your Anthropic account, and their Claude use is billed to you${s.has_api_key ? '' : ' (no key is saved yet)'}</label>
+      <label>Monthly Claude limit on their computer (USD) <span class="hint">they can change it there; leave it empty for the usual $100</span></label>
+      <input type="number" id="share-cap" min="1" step="1" value="20"/>
+      <div class="hint-box" style="margin-top:14px">Send the file only privately, for example on a USB stick or in a private message. Never upload it anywhere public: a Claude API key found online is blocked within minutes, and then the app stops working on every computer that uses it.<br/>For Kimi, they press <b>Log in to Kimi</b> in Settings on their computer and sign in with your Kimi account. Everyone then shares your subscription's usage limits.</div>
+      <div class="row" style="margin-top:14px"><button class="primary" id="share-make">Create the ZIP file</button></div>
+      <div class="field-msg" id="share-result"></div>
+    </div>
+    <div class="panel" style="margin-top:24px">
       <h2 style="margin-top:0">Help &amp; troubleshooting</h2>
       <dl class="kv" id="diag"><dt>Checking…</dt><dd></dd></dl>
       <div class="row" style="margin-top:14px">
@@ -1371,6 +1381,24 @@ async function renderSettings() {
   showKimi(false);
   $('#kimi-check').addEventListener('click', () => showKimi(true));
   $('#open-app').addEventListener('click', () => attempt(() => api('POST', '/api/open', { what: 'app' })));
+  $('#share-make').addEventListener('click', async () => {
+    const button = $('#share-make');
+    const out = $('#share-result');
+    button.disabled = true;
+    out.className = 'field-msg';
+    out.textContent = 'Creating the ZIP file…';
+    try {
+      const r = await api('POST', '/api/share-copy', { include_key: $('#share-key').checked, monthly_cap_usd: $('#share-cap').value });
+      out.className = 'field-msg ok';
+      out.innerHTML = `✓ Saved on your Desktop: <b>${esc(r.file)}</b> (${(r.bytes / 1024 / 1024).toFixed(1)} MB, ${r.include_key ? 'with your Claude API key' : 'without an API key'}${r.monthly_cap_usd ? `, monthly limit $${esc(r.monthly_cap_usd)}` : ''}). <button type="button" class="small" id="share-show">Show in folder</button>`;
+      $('#share-show').addEventListener('click', () => attempt(() => api('POST', '/api/share-copy/show')));
+    } catch (err) {
+      out.className = 'field-msg bad';
+      out.textContent = err.message;
+    } finally {
+      button.disabled = false;
+    }
+  });
   const showOutsideProjects = async () => {
     const box = $('#outside-projects');
     if (!box) return;

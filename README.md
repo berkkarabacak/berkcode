@@ -138,10 +138,17 @@ Good to know:
 
 ---
 
-## Sharing the app with friends
+## Sharing the app with family and friends
 
-- Share the folder **without** `node_modules`, `runtime`, `data`, `projects` and your `claudeapi.key` (they are excluded from git already). Each person needs **their own API key** (or their own Kimi subscription).
-- Zipping the folder and sending it works; so does "Code → Download ZIP" on GitHub.
+Everyone can use your Claude API key and your Kimi subscription:
+
+1. **Settings** → **Share the app with family and friends** → **Create the ZIP file**. It saves `Claude Agent Runner.zip` on your Desktop: the app, your Claude API key, and a monthly Claude limit for their computer ($20 unless you change it). Your projects, their history and your settings are not in it.
+2. Give them the ZIP **privately**, on a USB stick or in a private message. Never upload it anywhere public, and never add your key to the GitHub repository: the repository is public, and a key published online is blocked within minutes, which stops the app on every computer that uses it.
+3. On their computer: unblock and extract the ZIP, then double-click `start.bat` (the `START HERE.txt` inside explains it). Claude works right away.
+4. For **Kimi**: on their computer, Settings → **Kimi Code CLI** → **Install Kimi Code CLI**, then **Log in to Kimi**, and sign in with your Kimi account. Everyone shares your subscription's usage limits.
+5. Each computer only counts its own Claude spending against its own limit. To cap the total, set a monthly spend limit in the Claude Console (console.anthropic.com → Settings → Limits).
+
+To share without your key, untick **Include my Claude API key**: they then paste their own key in Settings. The app without any key can also be downloaded from GitHub (Code → Download ZIP).
 
 ## For developers
 
@@ -158,5 +165,6 @@ Good to know:
 - **Kimi** runs as `kimi acp` (Agent Client Protocol over stdio, `src/agents/kimi.js`). The memory tools are attached per session as an HTTP MCP server served by the app itself at `/mcp/<one-time token>` (`src/mcpHttp.js`), so nothing is written to Kimi's config or the project folder and the tool names match Claude's (`mcp__agent_memory__memory`). Sessions continue with `session/load`, Stop uses `session/cancel`, and runs use Never Ask mode. Kimi's own per-turn step limit ends a turn silently (it reports a normal end), so it is switched off (`KIMI_LOOP_MAX_STEPS_PER_TURN=0`) and the app counts tool calls itself and cancels at the limit. Kimi may end a turn and start another one by itself (for example after a background task), so a session only counts as finished after 10 quiet seconds with no tool running. `test/fixtures/fake-kimi.mjs` stands in for Kimi in the tests.
 - Portability: project folders inside the app folder are stored relative to it (`src/projects.js`); folder paths are compared in canonical form (8.3 short names and links resolved, `src/paths.js`); `data/runtime.json` records the app folder, so a copied file never makes one copy mistake another for itself; each project remembers the folder its agent session ran in (`session_folder`) and starts a fresh session when that changes; the desktop icon and the Startup entry are only created or taken over when they are missing or point at a folder that no longer exists. Because people copy the folder while the app runs in the background, the write-ahead log is folded into `app.db` after every idle heartbeat and every run (`checkpoint()` in `src/db.js`), and at startup a damaged database is set aside and replaced by the newest daily backup, with a banner explaining it.
 - The icon next to the clock is `scripts/tray.ps1` (Windows PowerShell 5.1 + Windows Forms, so no native modules or compiled binaries). The server starts it (`src/tray.js`) only when it was started by the launcher; it polls `GET /api/tray` every 2 seconds (state, tooltip and menu lines from `src/status.js`) and closes itself when the server process is gone or the icon is switched off in Settings. It is launched through a short-lived `Start-Process`, because Node kills its direct children together with itself (which would leave a dead icon until the mouse passes over it) and Windows PowerShell started as a detached process without a console exits at once. If the icon stops checking in, the server starts it again (at most 4 times an hour). `-SelfTest` builds the icon and menu without showing them.
+- Sharing (`src/shareCopy.js`): the ZIP holds the app's own files (never `data`, `projects`, `runtime`, `node_modules`, `.git` or key files), a `START HERE.txt`, and on request `claudeapi.key` (imported at the copy's first start like any key file) and `copy-settings.json` (only `monthly_cap_usd`, applied once; `copy_settings_hash` remembers it).
 - Default memory templates are in `src/templates.js`. The standing instructions are in `src/prompt.js`.
 - Development: `npm install`, then `node src/launcher.js` (or `node src/server.js --port=4290`). Tests: `npm test`.
