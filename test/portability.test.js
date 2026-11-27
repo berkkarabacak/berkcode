@@ -26,7 +26,7 @@ after(() => {
   }
 });
 
-test('paths are compared the way Windows does', () => {
+test('paths are compared the way Windows does', { skip: process.platform !== 'win32' }, () => {
   assert.ok(samePath('C:\\Apps\\Runner', 'c:\\apps\\runner\\'));
   assert.ok(!samePath('C:\\Apps\\Runner', 'C:\\Apps\\Runner2'));
   assert.ok(isInside('C:\\Apps\\Runner\\projects\\A', 'C:\\Apps\\Runner'));
@@ -44,7 +44,7 @@ test('folders inside the app folder are stored relative to it, other folders as 
   assert.equal(resolveFolder(outside), outside);
 });
 
-test('a folder given with a short (8.3) name inside the app folder is still stored relative to it', (t) => {
+test('a folder given with a short (8.3) name inside the app folder is still stored relative to it', { skip: process.platform !== 'win32' }, (t) => {
   const short = spawnSync('cmd.exe', ['/d', '/s', '/c', `"for %I in ("${APP_ROOT}") do @echo %~sI"`], { encoding: 'utf8', windowsVerbatimArguments: true }).stdout.trim();
   if (!short || short.toLowerCase() === APP_ROOT.toLowerCase()) return t.skip('the app folder has no short name here');
   assert.equal(storeFolder(path.join(short, 'projects', 'My site')), path.join('projects', 'My site'));

@@ -100,6 +100,12 @@ This file holds no passwords or keys, only where they are. Keep it that way.
    - `curl -s -o /dev/null -w '%{http_code}\n' -X POST https://agents.berkkarabacak.com/mcp/x` prints `404`;
    - `curl -sI http://agents.berkkarabacak.com/` gives `301` to `https://`.
 
+   **All checks at once:** `/opt/agent-runner/deploy/smoke-test.sh`
+   - It also signs in and out once, reading the password file without printing it. Run it as root on the server, or
+     from anywhere with `BASE=https://agents.berkkarabacak.com /opt/agent-runner/deploy/smoke-test.sh`.
+   - It ends with `All checks passed.`
+   - GitHub runs the same checks on every change: the "CI" workflow builds this container with `deploy/run.sh`.
+
 ## 6. Handing over to Berk
 - **Password.**
   - The app made it at its first start: three words and a number, in `/var/lib/agent-runner/app/initial-password.txt`.

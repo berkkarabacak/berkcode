@@ -1,0 +1,42 @@
+# The tests on Linux, and the web version's container built and checked exactly the way it is deployed
+# (deploy/HANDOVER.md). Runs on GitHub's own machines; nothing here touches a real server.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  tests:
+    name: Tests on Linux
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - run: npm test
+
+  container:
+    name: Web version in Docker
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build and start it with deploy/run.sh, as on the server
+        run: sudo PUBLIC_URL=https://agents.example.test bash deploy/run.sh
+      - name: The checks from the handover (deploy/smoke-test.sh)
+        run: sudo bash deploy/smoke-test.sh
+      - name: How the container runs, and a whole chat inside it
+        run: bash .github/container-checks.sh
+      - name: App log
+        if: always()
+        run: docker logs --tail 80 agent-runner 2>&1 || true
